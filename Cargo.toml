@@ -1,0 +1,26 @@
+[workspace]
+members = [
+    "crates/forge-lang",
+    "crates/forge-ir",
+    "crates/forge-opt",
+    "crates/forge-codegen",
+    "crates/forge-runtime",
+    "crates/forge-std",
+    "crates/forge-driver",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+version = "0.1.0"
+license = "MIT OR Apache-2.0"
+authors = ["Forge Contributors"]
+
+[workspace.dependencies]
+anyhow = "1.0.93"
+bumpalo = "3.16.0"
+clap = { version = "4.5.21", features = ["derive"] }
+phf = { version = "0.11.2", features = ["macros"] }
+rayon = "1.10.0"
+smallvec = "1.13.2"
+thiserror = "1.0.69"

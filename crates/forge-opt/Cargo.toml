@@ -1,0 +1,9 @@
+[package]
+name = "forge-opt"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+forge-ir = { path = "../forge-ir" }
+thiserror = { workspace = true }

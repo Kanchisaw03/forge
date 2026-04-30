@@ -1,0 +1,9 @@
+[package]
+name = "forge-std"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+forge-runtime = { path = "../forge-runtime" }
+rayon = { workspace = true }

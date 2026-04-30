@@ -1,0 +1,19 @@
+# Design docs
+forge_system_design_part*.md.resolved
+FORGE_SESSION_CONTEXT.md
+
+# Build artifacts
+/target/
+/target_sandbox/
+
+# Rust backups
+**/*.rs.bk
+
+# IDE/editor
+/.vscode/
+/.idea/
+/*.code-workspace
+
+# OS
+.DS_Store
+Thumbs.db

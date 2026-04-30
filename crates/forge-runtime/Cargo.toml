@@ -1,0 +1,11 @@
+[package]
+name = "forge-runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+crossbeam-deque = "0.8.6"
+rayon = { workspace = true }
+smallvec = { workspace = true }
+thiserror = { workspace = true }

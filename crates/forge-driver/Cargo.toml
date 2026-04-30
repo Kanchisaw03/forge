@@ -1,0 +1,28 @@
+[package]
+name = "forge-driver"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "forge-driver"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+bumpalo = { workspace = true }
+clap = { workspace = true }
+forge-codegen = { path = "../forge-codegen" }
+forge-ir = { path = "../forge-ir" }
+forge-lang = { path = "../forge-lang" }
+forge-opt = { path = "../forge-opt" }
+forge-runtime = { path = "../forge-runtime" }
+forge-std = { path = "../forge-std" }
+
+[dependencies.pyo3]
+version = "0.22.6"
+optional = true
+features = ["extension-module"]
+
+[features]
+python = ["dep:pyo3"]

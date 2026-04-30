@@ -1,0 +1,10 @@
+[package]
+name = "forge-codegen"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+forge-ir = { path = "../forge-ir" }
+forge-opt = { path = "../forge-opt" }
+thiserror = { workspace = true }
