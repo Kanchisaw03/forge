@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand};
 
-use crate::bench::{run_matmul_bench, BenchConfig};
+use crate::bench::{print_diagnostics, run_matmul_bench, BenchConfig};
 use crate::compile::{check_file, compile_file, dump_stage, DumpStage};
 
 #[derive(Parser, Debug)]
@@ -38,6 +38,8 @@ enum Commands {
     },
     Bench {
         input: PathBuf,
+        #[arg(long, default_value_t = 256)]
+        size: usize,
         #[arg(long, default_value_t = 5)]
         warmup: usize,
         #[arg(long, default_value_t = 20)]
@@ -87,13 +89,22 @@ fn main() -> Result<()> {
         }
         Commands::Bench {
             input: _input,
+            size,
             warmup,
             iters,
         } => {
-            let result = run_matmul_bench(BenchConfig { warmup, iters }, 256);
+            print_diagnostics();
+            let result = run_matmul_bench(BenchConfig { warmup, iters }, size);
             println!(
-                "latency_ms={:.3} gflops={:.3}",
-                result.latency_ms, result.gflops
+                "size={} latency_ms={:.3} mean_ms={:.3} p50_ms={:.3} p95_ms={:.3} p99_ms={:.3} gflops={:.3} gb_per_s={:.3}",
+                size,
+                result.mean_ms,
+                result.mean_ms,
+                result.p50_ms,
+                result.p95_ms,
+                result.p99_ms,
+                result.gflops,
+                result.gb_per_s
             );
         }
         Commands::Check { input } => {
@@ -108,6 +119,7 @@ fn main() -> Result<()> {
         }
         Commands::Info => {
             print_cpu_info();
+            print_diagnostics();
         }
     }
     Ok(())

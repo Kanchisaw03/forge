@@ -7,3 +7,10 @@ license.workspace = true
 [dependencies]
 forge-runtime = { path = "../forge-runtime" }
 rayon = { workspace = true }
+
+[dev-dependencies]
+criterion = { version = "0.5.1", features = ["html_reports"] }
+
+[[bench]]
+name = "sgemm"
+harness = false

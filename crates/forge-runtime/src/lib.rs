@@ -9,7 +9,9 @@ pub mod warp;
 
 pub use barrier::SenseBarrier;
 pub use launch::{launch_2d, launch_3d, LaunchConfig, ThreadCtx};
-pub use pool::{deque, Stealer, Worker};
+pub use pool::{
+    deque, init_rayon_global_pool, physical_cpu_count, Stealer, Worker,
+};
 pub use shared::{ArgBuilder, KernelArgs, SharedMemory};
 pub use tensor::{DType, Tensor, TensorAllocator, SIZE_CLASSES};
 pub use warp::{blend_lanes, branch_masks, WarpMask, WARP_LANES};

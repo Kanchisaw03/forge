@@ -5,6 +5,11 @@ FORGE_SESSION_CONTEXT.md
 # Build artifacts
 /target/
 /target_sandbox/
+/results/
+
+# Local developer environments
+/.cargo/
+/.venv/
 
 # Rust backups
 **/*.rs.bk

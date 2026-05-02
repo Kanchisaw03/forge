@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 crossbeam-deque = "0.8.6"
+num_cpus = { workspace = true }
 rayon = { workspace = true }
 smallvec = { workspace = true }
 thiserror = { workspace = true }

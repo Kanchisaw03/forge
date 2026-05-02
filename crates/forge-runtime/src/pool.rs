@@ -1,6 +1,37 @@
-use std::sync::Arc;
+use std::sync::{Arc, Once};
 
 use crossbeam_deque::{Injector, Steal, Stealer as CbStealer, Worker as CbWorker};
+
+static INIT_RAYON_GLOBAL_POOL: Once = Once::new();
+
+/// Returns the physical CPU core count used by Forge for compute-bound kernels.
+pub fn physical_cpu_count() -> usize {
+    num_cpus::get_physical().max(1)
+}
+
+/// Initializes Rayon global pool once, pinned to physical cores.
+///
+/// Returns the currently active Rayon global thread count.
+pub fn init_rayon_global_pool() -> usize {
+    INIT_RAYON_GLOBAL_POOL.call_once(|| {
+        let num_threads = physical_cpu_count();
+        let result = rayon::ThreadPoolBuilder::new()
+            .num_threads(num_threads)
+            .thread_name(|i| format!("forge-worker-{i}"))
+            .build_global();
+
+        match result {
+            Ok(()) => eprintln!(
+                "[forge-runtime] initialized Rayon global pool with {num_threads} threads"
+            ),
+            Err(err) => eprintln!(
+                "[forge-runtime] Rayon global pool already initialized elsewhere: {err}"
+            ),
+        }
+    });
+
+    rayon::current_num_threads()
+}
 
 /// Owner-side push/pop handle.
 pub struct Worker<T> {
@@ -95,5 +126,33 @@ mod tests {
         }
         let guard = seen.lock().expect("lock must succeed");
         assert_eq!(guard.len(), 10_000);
+    }
+
+    #[test]
+    fn rayon_global_pool_reaches_physical_cores() {
+        let configured = init_rayon_global_pool();
+        let expected = physical_cpu_count();
+        let seen_threads = Arc::new(Mutex::new(HashSet::new()));
+
+        rayon::scope(|scope| {
+            for _ in 0..4_096 {
+                let seen_threads = Arc::clone(&seen_threads);
+                scope.spawn(move |_| {
+                    if let Some(idx) = rayon::current_thread_index() {
+                        seen_threads.lock().expect("lock must succeed").insert(idx);
+                    }
+                });
+            }
+        });
+
+        let unique = seen_threads.lock().expect("lock must succeed").len();
+        assert!(
+            configured >= 1,
+            "rayon should report at least one thread, got {configured}"
+        );
+        assert!(
+            unique + 1 >= expected,
+            "expected about {expected} worker threads, observed {unique}"
+        );
     }
 }

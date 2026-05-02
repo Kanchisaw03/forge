@@ -18,6 +18,8 @@ forge-lang = { path = "../forge-lang" }
 forge-opt = { path = "../forge-opt" }
 forge-runtime = { path = "../forge-runtime" }
 forge-std = { path = "../forge-std" }
+num_cpus = { workspace = true }
+rayon = { workspace = true }
 
 [dependencies.pyo3]
 version = "0.22.6"

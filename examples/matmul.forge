@@ -1,0 +1,13 @@
+@kernel
+fn matmul(a: &[f32], b: &[f32], out: &mut [f32], N: u32) {
+    let row = thread::x();
+    let col = thread::y();
+
+    if row < N && col < N {
+        let mut sum: f32 = 0.0;
+        for k in 0u32..N {
+            sum += a[row * N + k] * b[k * N + col];
+        }
+        out[row * N + col] = sum;
+    }
+}
