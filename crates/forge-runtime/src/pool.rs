@@ -9,12 +9,30 @@ pub fn physical_cpu_count() -> usize {
     num_cpus::get_physical().max(1)
 }
 
+/// Returns the Rayon thread count target for compute-bound kernels.
+pub fn optimal_thread_count() -> usize {
+    if let Some(override_threads) = std::env::var_os("FORGE_RAYON_THREADS") {
+        if let Some(parsed) = override_threads.to_str().and_then(|v| v.parse::<usize>().ok()) {
+            return parsed.clamp(1, 64);
+        }
+    }
+
+    let physical = num_cpus::get_physical();
+    let logical = num_cpus::get();
+    let threads = if physical > 0 {
+        physical
+    } else {
+        (logical / 2).max(1)
+    };
+    threads.clamp(1, 64)
+}
+
 /// Initializes Rayon global pool once, pinned to physical cores.
 ///
 /// Returns the currently active Rayon global thread count.
 pub fn init_rayon_global_pool() -> usize {
     INIT_RAYON_GLOBAL_POOL.call_once(|| {
-        let num_threads = physical_cpu_count();
+        let num_threads = optimal_thread_count();
         let result = rayon::ThreadPoolBuilder::new()
             .num_threads(num_threads)
             .thread_name(|i| format!("forge-worker-{i}"))
@@ -31,6 +49,13 @@ pub fn init_rayon_global_pool() -> usize {
     });
 
     rayon::current_num_threads()
+}
+
+/// Prints current thread diagnostics for benchmark and profiling paths.
+pub fn print_thread_diagnostics() {
+    println!("Rayon threads:   {}", rayon::current_num_threads());
+    println!("Physical cores:  {}", num_cpus::get_physical());
+    println!("Logical cores:   {}", num_cpus::get());
 }
 
 /// Owner-side push/pop handle.

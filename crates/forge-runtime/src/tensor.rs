@@ -44,7 +44,7 @@ impl Slab {
     }
 }
 
-/// 32-byte aligned slab allocator for tensors.
+/// 64-byte aligned slab allocator for tensors.
 pub struct TensorAllocator {
     slabs: Vec<Slab>,
     large: Mutex<HashMap<usize, Layout>>,
@@ -61,21 +61,21 @@ impl TensorAllocator {
         })
     }
 
-    /// Allocates raw bytes with 32-byte alignment.
+    /// Allocates raw bytes with 64-byte alignment.
     pub fn alloc(&self, bytes: usize) -> NonNull<u8> {
         if let Some((idx, class)) = find_size_class(bytes) {
             if let Some(ptr) = self.slabs[idx].free_list.lock().expect("slab lock").pop() {
                 return ptr;
             }
-            let layout = Layout::from_size_align(class, 32).expect("valid slab layout");
-            // SAFETY: `layout` is non-zero size and 32-byte aligned. We check null and wrap in NonNull.
+            let layout = Layout::from_size_align(class, 64).expect("valid slab layout");
+            // SAFETY: `layout` is non-zero size and 64-byte aligned. We check null and wrap in NonNull.
             let raw = unsafe { alloc(layout) };
             let ptr = NonNull::new(raw).expect("allocation must succeed");
             self.total_allocated.fetch_add(class, Ordering::Relaxed);
             ptr
         } else {
-            let layout = Layout::from_size_align(bytes.max(32), 32).expect("valid large layout");
-            // SAFETY: `layout` is valid and aligned to 32 bytes. Null is checked below.
+            let layout = Layout::from_size_align(bytes.max(64), 64).expect("valid large layout");
+            // SAFETY: `layout` is valid and aligned to 64 bytes. Null is checked below.
             let raw = unsafe { alloc(layout) };
             let ptr = NonNull::new(raw).expect("allocation must succeed");
             self.large
@@ -196,5 +196,13 @@ mod tests {
         drop(tensors);
         let after = alloc.total_allocated_bytes();
         assert!(after >= before);
+    }
+
+    #[test]
+    fn tensor_allocations_are_64_byte_aligned() {
+        let alloc = TensorAllocator::new();
+        let tensor = alloc.tensor(1024, DType::F32, vec![1024u32]);
+        let addr = tensor.as_mut_ptr() as usize;
+        assert_eq!(addr % 64, 0, "tensor pointer should be 64-byte aligned");
     }
 }

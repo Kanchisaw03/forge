@@ -8,7 +8,8 @@ FORGE_SESSION_CONTEXT.md
 /results/
 
 # Local developer environments
-/.cargo/
+/.cargo/*
+!/.cargo/config.toml
 /.venv/
 
 # Rust backups

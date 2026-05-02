@@ -8,7 +8,9 @@ use std::path::PathBuf;
 use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand};
 
-use crate::bench::{print_diagnostics, run_matmul_bench, BenchConfig};
+use crate::bench::{
+    print_benchmark_header, run_matmul_bench, theoretical_peak_gflops, BenchConfig,
+};
 use crate::compile::{check_file, compile_file, dump_stage, DumpStage};
 
 #[derive(Parser, Debug)]
@@ -89,23 +91,42 @@ fn main() -> Result<()> {
         }
         Commands::Bench {
             input: _input,
-            size,
+            size: _size,
             warmup,
             iters,
         } => {
-            print_diagnostics();
-            let result = run_matmul_bench(BenchConfig { warmup, iters }, size);
-            println!(
-                "size={} latency_ms={:.3} mean_ms={:.3} p50_ms={:.3} p95_ms={:.3} p99_ms={:.3} gflops={:.3} gb_per_s={:.3}",
-                size,
-                result.mean_ms,
-                result.mean_ms,
-                result.p50_ms,
-                result.p95_ms,
-                result.p99_ms,
-                result.gflops,
-                result.gb_per_s
-            );
+            print_benchmark_header();
+
+            let sizes = [256usize, 512, 1024];
+            let mut results = Vec::with_capacity(sizes.len());
+            for &n in &sizes {
+                let result = run_matmul_bench(BenchConfig { warmup, iters }, n);
+                println!(
+                    "Size: {n}x{n} | Latency: {:.2} ms | GFLOPS: {:.1}",
+                    result.mean_ms, result.gflops
+                );
+                println!(
+                    "FORGE_RESULT: size={n}x{n} latency_ms={:.2} gflops={:.1}",
+                    result.mean_ms, result.gflops
+                );
+                results.push((n, result));
+            }
+
+            let theoretical = theoretical_peak_gflops();
+            println!("==========================================");
+            println!("Size        Forge    Theoretical   % Peak");
+            println!("==========================================");
+            for (n, result) in results {
+                let pct = (result.gflops / theoretical) * 100.0;
+                println!(
+                    "{:<10} {:>6.1} GF {:>8.1} GF {:>8.1}%",
+                    format!("{n}x{n}"),
+                    result.gflops,
+                    theoretical,
+                    pct
+                );
+            }
+            println!("==========================================");
         }
         Commands::Check { input } => {
             check_file(&input)?;
@@ -119,7 +140,7 @@ fn main() -> Result<()> {
         }
         Commands::Info => {
             print_cpu_info();
-            print_diagnostics();
+            print_benchmark_header();
         }
     }
     Ok(())
