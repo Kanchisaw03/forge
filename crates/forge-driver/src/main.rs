@@ -39,9 +39,8 @@ enum Commands {
         output: Option<PathBuf>,
     },
     Bench {
-        input: PathBuf,
-        #[arg(long, default_value_t = 256)]
-        size: usize,
+        #[arg(long)]
+        size: Option<usize>,
         #[arg(long, default_value_t = 5)]
         warmup: usize,
         #[arg(long, default_value_t = 20)]
@@ -90,43 +89,46 @@ fn main() -> Result<()> {
             );
         }
         Commands::Bench {
-            input: _input,
-            size: _size,
+            size,
             warmup,
             iters,
         } => {
             print_benchmark_header();
 
-            let sizes = [256usize, 512, 1024];
+            let default_sizes = [256usize, 512, 1024];
+            let sizes: Vec<usize> = match size {
+                Some(n) => vec![n],
+                None => default_sizes.to_vec(),
+            };
             let mut results = Vec::with_capacity(sizes.len());
             for &n in &sizes {
                 let result = run_matmul_bench(BenchConfig { warmup, iters }, n);
-                println!(
-                    "Size: {n}x{n} | Latency: {:.2} ms | GFLOPS: {:.1}",
-                    result.mean_ms, result.gflops
-                );
-                println!(
-                    "FORGE_RESULT: size={n}x{n} latency_ms={:.2} gflops={:.1}",
-                    result.mean_ms, result.gflops
-                );
                 results.push((n, result));
             }
 
             let theoretical = theoretical_peak_gflops();
-            println!("==========================================");
-            println!("Size        Forge    Theoretical   % Peak");
-            println!("==========================================");
-            for (n, result) in results {
+            println!("  Size          Latency       GFLOPS      % of Peak");
+            for (n, result) in &results {
                 let pct = (result.gflops / theoretical) * 100.0;
                 println!(
-                    "{:<10} {:>6.1} GF {:>8.1} GF {:>8.1}%",
-                    format!("{n}x{n}"),
+                    "  {:<14} {:>8.2} ms   {:>8.1}   {:>6.0}%",
+                    format!("{n}×{n}"),
+                    result.mean_ms,
                     result.gflops,
-                    theoretical,
                     pct
                 );
             }
-            println!("==========================================");
+            println!();
+            println!("────────────────────────────────────────────────────────────");
+            for (n, result) in &results {
+                println!(
+                    "  FORGE_RESULT: size={:<10} latency_ms={:.2} gflops={:.1}",
+                    format!("{n}x{n}"),
+                    result.mean_ms,
+                    result.gflops
+                );
+            }
+            println!("────────────────────────────────────────────────────────────");
         }
         Commands::Check { input } => {
             check_file(&input)?;
@@ -139,7 +141,6 @@ fn main() -> Result<()> {
             println!("{output}");
         }
         Commands::Info => {
-            print_cpu_info();
             print_benchmark_header();
         }
     }
@@ -153,20 +154,4 @@ fn parse_pair(s: &str) -> Result<(u32, u32)> {
     let x = a.parse::<u32>()?;
     let y = b.parse::<u32>()?;
     Ok((x, y))
-}
-
-fn print_cpu_info() {
-    #[cfg(target_arch = "x86_64")]
-    {
-        println!(
-            "avx2={} fma={} sse4.2={}",
-            std::is_x86_feature_detected!("avx2"),
-            std::is_x86_feature_detected!("fma"),
-            std::is_x86_feature_detected!("sse4.2")
-        );
-    }
-    #[cfg(not(target_arch = "x86_64"))]
-    {
-        println!("non-x86_64 target");
-    }
 }

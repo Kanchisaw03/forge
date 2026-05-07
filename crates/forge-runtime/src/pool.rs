@@ -17,12 +17,14 @@ pub fn optimal_thread_count() -> usize {
         }
     }
 
-    let physical = num_cpus::get_physical();
-    let logical = num_cpus::get();
-    let threads = if physical > 0 {
-        physical
+    let physical = num_cpus::get_physical().max(1);
+    let logical = num_cpus::get().max(1);
+    let threads = if physical <= 2 && logical >= physical * 2 {
+        // Dual-core client CPUs often benefit from using all SMT threads
+        // for throughput-oriented kernels (e.g. SGEMM at >=512^3 sizes).
+        logical.min(4)
     } else {
-        (logical / 2).max(1)
+        physical
     };
     threads.clamp(1, 64)
 }

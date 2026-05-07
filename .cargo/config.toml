@@ -6,3 +6,12 @@ rustflags = [
   "-C", "embed-bitcode=yes",
   "-C", "lto=thin",
 ]
+
+[target.x86_64-pc-windows-msvc]
+rustflags = [
+  "-C", "target-cpu=native",
+  "-C", "opt-level=3",
+  "-C", "codegen-units=1",
+  "-C", "embed-bitcode=yes",
+  "-C", "lto=thin",
+]

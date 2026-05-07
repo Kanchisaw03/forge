@@ -1,14 +1,19 @@
 use rayon::prelude::*;
-use std::sync::Once;
+use std::alloc::{alloc, dealloc, handle_alloc_error, Layout};
+use std::cell::RefCell;
+use std::ptr::NonNull;
+use std::sync::{Once, OnceLock};
 
-const MC: usize = 72;
-const KC: usize = 256;
-const NC: usize = 1024;
+const MC_DEFAULT: usize = 192;
+const KC_DEFAULT: usize = 256;
+const NC_DEFAULT: usize = 2048;
 const MR: usize = 6;
 const NR_AVX2: usize = 16;
 const NR_AVX512: usize = 32;
+const PACK_ALIGN_BYTES: usize = 64;
 
 static TILING_LOG_ONCE: Once = Once::new();
+static TILE_BLOCKS: OnceLock<TileConfig> = OnceLock::new();
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum KernelKind {
@@ -23,6 +28,91 @@ impl KernelKind {
         match self {
             Self::Avx512 => NR_AVX512,
             Self::Avx2 | Self::Scalar => NR_AVX2,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct TileConfig {
+    mc: usize,
+    kc: usize,
+    nc: usize,
+}
+
+thread_local! {
+    static PACK_A_BUF: RefCell<AlignedPackBuffer> =
+        RefCell::new(AlignedPackBuffer::new(PACK_ALIGN_BYTES));
+}
+
+struct AlignedPackBuffer {
+    ptr: NonNull<f32>,
+    capacity: usize,
+    align: usize,
+}
+
+impl AlignedPackBuffer {
+    const fn new(align: usize) -> Self {
+        Self {
+            ptr: NonNull::dangling(),
+            capacity: 0,
+            align,
+        }
+    }
+
+    fn as_mut_slice(&mut self, len: usize) -> &mut [f32] {
+        self.ensure_capacity(len);
+        // SAFETY: `ensure_capacity` guarantees allocation for `len` f32 values.
+        unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr(), len) }
+    }
+
+    fn ensure_capacity(&mut self, len: usize) {
+        if len <= self.capacity {
+            return;
+        }
+        let new_capacity = len.next_power_of_two();
+        self.grow(new_capacity);
+    }
+
+    fn grow(&mut self, new_capacity: usize) {
+        debug_assert!(new_capacity > self.capacity);
+        let new_layout = Self::layout(new_capacity, self.align);
+        // SAFETY: layout is valid and non-zero-sized.
+        let new_raw = unsafe { alloc(new_layout) };
+        if new_raw.is_null() {
+            handle_alloc_error(new_layout);
+        }
+        // SAFETY: null already handled above.
+        let new_ptr = unsafe { NonNull::new_unchecked(new_raw as *mut f32) };
+
+        if self.capacity != 0 {
+            let old_layout = Self::layout(self.capacity, self.align);
+            // SAFETY: pointer/layout pair matches previous allocation.
+            unsafe {
+                dealloc(self.ptr.as_ptr() as *mut u8, old_layout);
+            }
+        }
+
+        self.ptr = new_ptr;
+        self.capacity = new_capacity;
+    }
+
+    fn layout(capacity: usize, align: usize) -> Layout {
+        let bytes = capacity
+            .checked_mul(std::mem::size_of::<f32>())
+            .expect("packed buffer size overflow");
+        Layout::from_size_align(bytes, align).expect("packed buffer layout must be valid")
+    }
+}
+
+impl Drop for AlignedPackBuffer {
+    fn drop(&mut self) {
+        if self.capacity == 0 {
+            return;
+        }
+        let layout = Self::layout(self.capacity, self.align);
+        // SAFETY: pointer/layout pair matches previous allocation.
+        unsafe {
+            dealloc(self.ptr.as_ptr() as *mut u8, layout);
         }
     }
 }
@@ -80,7 +170,23 @@ pub fn sgemm(
 /// Invariants:
 /// - same as [`sgemm`]
 pub fn matmul(a: &[f32], b: &[f32], c: &mut [f32], m: usize, n: usize, k: usize) {
-    sgemm(a, b, c, m, n, k, 1.0, 0.0);
+    assert_eq!(a.len(), m * k);
+    assert_eq!(b.len(), k * n);
+    assert_eq!(c.len(), m * n);
+
+    c.fill(0.0);
+    if m == 0 || n == 0 || k == 0 {
+        return;
+    }
+
+    matmul_packed(a, b, c, m, n, k);
+}
+
+#[inline(always)]
+fn matmul_packed(a: &[f32], b: &[f32], c: &mut [f32], m: usize, n: usize, k: usize) {
+    let kernel = select_kernel_for_problem(detect_kernel_kind(), m, n, k);
+    maybe_log_tiling(kernel);
+    sgemm_with_kernel(a, b, c, m, n, k, 1.0, kernel);
 }
 
 fn detect_kernel_kind() -> KernelKind {
@@ -133,43 +239,82 @@ fn sgemm_with_kernel(
     alpha: f32,
     kernel: KernelKind,
 ) {
+    let tiles = tile_blocks();
+    let low_core_client = std::thread::available_parallelism()
+        .map(|n| n.get() <= 4)
+        .unwrap_or(false);
+    let kc_block = if low_core_client && k >= 1024 {
+        // Large reductions on low-core client CPUs sustain better clocks
+        // with a shallower K block.
+        tiles.kc.min(128)
+    } else {
+        tiles.kc
+    };
+    let nc_block = tiles.nc;
     let nr_actual = kernel.nr();
 
-    for jc in (0..n).step_by(NC) {
-        let nc = (n - jc).min(NC);
+    // Dynamically shrink MC so we get enough parallel chunks for all cores
+    // while keeping each chunk large enough for cache efficiency.
+    let num_threads = rayon::current_num_threads().max(1);
+    let min_chunks = if num_threads > 2 && m <= 256 {
+        2
+    } else {
+        num_threads.max(4)
+    };
+    let mc_block = if m > 0 {
+        let mc_max = tiles.mc;
+        let mc_for_balance = align_down((m + min_chunks - 1) / min_chunks, MR).max(MR);
+        mc_max.min(mc_for_balance)
+    } else {
+        tiles.mc
+    };
 
-        for pc in (0..k).step_by(KC) {
-            let kc = (k - pc).min(KC);
+    let max_kc = kc_block.min(k.max(1));
+    let max_nc = nc_block.min(n.max(1));
+    let mut packed_b_buf = AlignedPackBuffer::new(PACK_ALIGN_BYTES);
+    packed_b_buf.ensure_capacity(div_ceil(max_nc, nr_actual) * max_kc * nr_actual);
 
-            let mut packed_b = vec![0.0f32; div_ceil(nc, nr_actual) * kc * nr_actual];
+    for jc in (0..n).step_by(nc_block) {
+        let nc = (n - jc).min(nc_block);
+
+        for pc in (0..k).step_by(kc_block) {
+            let kc = (k - pc).min(kc_block);
+
+            let packed_b_len = div_ceil(nc, nr_actual) * kc * nr_actual;
+            let packed_b = packed_b_buf.as_mut_slice(packed_b_len);
             if nr_actual == NR_AVX512 {
-                pack_b_avx512(b, n, pc, jc, kc, nc, &mut packed_b);
+                pack_b_avx512(b, n, pc, jc, kc, nc, packed_b);
             } else {
-                pack_b_avx2(b, n, pc, jc, kc, nc, &mut packed_b);
+                pack_b_avx2(b, n, pc, jc, kc, nc, packed_b);
             }
+            let packed_b: &[f32] = packed_b;
 
-            let row_block_elems = n * MC;
+            let row_block_elems = n * mc_block;
             c.par_chunks_mut(row_block_elems)
                 .enumerate()
                 .for_each(|(tile_i, c_rows)| {
-                    let ic = tile_i * MC;
+                    let ic = tile_i * mc_block;
                     let mc = c_rows.len() / n;
 
-                    let mut packed_a = vec![0.0f32; div_ceil(mc, MR) * kc * MR];
-                    pack_a(a, k, ic, pc, mc, kc, alpha, &mut packed_a);
+                    PACK_A_BUF.with(|pack_a_buf| {
+                        let mut pack_a_buf = pack_a_buf.borrow_mut();
+                        let packed_a_len = div_ceil(mc, MR) * kc * MR;
+                        let packed_a = pack_a_buf.as_mut_slice(packed_a_len);
+                        pack_a(a, k, ic, pc, mc, kc, alpha, packed_a);
 
-                    gebp(
-                        &packed_a,
-                        &packed_b,
-                        c_rows,
-                        n,
-                        jc,
-                        mc,
-                        nc,
-                        kc,
-                        nr_actual,
-                        kernel,
-                    );
+                        gebp(
+                            packed_a,
+                            packed_b,
+                            c_rows,
+                            n,
+                            jc,
+                            mc,
+                            nc,
+                            kc,
+                            nr_actual,
+                            kernel,
+                        );
+                    });
                 });
         }
     }
@@ -245,15 +390,17 @@ fn pack_b_with_nr(
     packed_b: &mut [f32],
 ) {
     let n_panels = div_ceil(nc, nr);
+    let panel_stride = kc * nr;
     for jp in 0..n_panels {
+        let panel_base = jp * panel_stride;
+        let panel = &mut packed_b[panel_base..panel_base + panel_stride];
         let col_base = jp * nr;
-        let panel_base = jp * kc * nr;
         for kk in 0..kc {
             let src_row = pc + kk;
-            let dst_base = panel_base + kk * nr;
+            let dst_base = kk * nr;
             for jj in 0..nr {
                 let col = col_base + jj;
-                packed_b[dst_base + jj] = if col < nc {
+                panel[dst_base + jj] = if col < nc {
                     b[src_row * ldb + (jc + col)]
                 } else {
                     0.0
@@ -286,6 +433,11 @@ fn gebp(
         for jp in 0..n_panels {
             let col = jp * nr_actual;
             let b_panel = &packed_b[jp * kc * nr_actual..(jp + 1) * kc * nr_actual];
+            prefetch_t0(b_panel.as_ptr());
+            if jp + 1 < n_panels {
+                let next_panel_offset = (jp + 1) * kc * nr_actual;
+                prefetch_t0(unsafe { packed_b.as_ptr().add(next_panel_offset) });
+            }
 
             let tile_m = (mc - row).min(MR);
             let tile_n = (nc - col).min(nr_actual);
@@ -411,47 +563,90 @@ unsafe fn microkernel_6x16_avx2(a: *const f32, b: *const f32, c: *mut f32, kc: u
     let mut c10 = _mm256_setzero_ps();
     let mut c11 = _mm256_setzero_ps();
 
-    for kk in 0..kc {
-        if kk + 8 < kc {
-            _mm_prefetch(b.add((kk + 8) * NR_AVX2) as *const i8, _MM_HINT_T0);
-        }
-
-        // ymm12 / ymm13 at the ISA level.
-        let b0 = _mm256_loadu_ps(b.add(kk * NR_AVX2));
-        let b1 = _mm256_loadu_ps(b.add(kk * NR_AVX2 + 8));
-
-        // ymm14 broadcasts in sequence.
-        let a0 = _mm256_broadcast_ss(&*a.add(kk * MR));
-        c0 = _mm256_fmadd_ps(b0, a0, c0);
-        c6 = _mm256_fmadd_ps(b1, a0, c6);
-
-        let a1 = _mm256_broadcast_ss(&*a.add(kk * MR + 1));
-        c1 = _mm256_fmadd_ps(b0, a1, c1);
-        c7 = _mm256_fmadd_ps(b1, a1, c7);
-
-        let a2 = _mm256_broadcast_ss(&*a.add(kk * MR + 2));
-        c2 = _mm256_fmadd_ps(b0, a2, c2);
-        c8 = _mm256_fmadd_ps(b1, a2, c8);
-
-        let a3 = _mm256_broadcast_ss(&*a.add(kk * MR + 3));
-        c3 = _mm256_fmadd_ps(b0, a3, c3);
-        c9 = _mm256_fmadd_ps(b1, a3, c9);
-
-        let a4 = _mm256_broadcast_ss(&*a.add(kk * MR + 4));
-        c4 = _mm256_fmadd_ps(b0, a4, c4);
-        c10 = _mm256_fmadd_ps(b1, a4, c10);
-
-        let a5 = _mm256_broadcast_ss(&*a.add(kk * MR + 5));
-        c5 = _mm256_fmadd_ps(b0, a5, c5);
-        c11 = _mm256_fmadd_ps(b1, a5, c11);
-    }
-
     let row0 = c;
     let row1 = c.add(ldc);
     let row2 = c.add(2 * ldc);
     let row3 = c.add(3 * ldc);
     let row4 = c.add(4 * ldc);
     let row5 = c.add(5 * ldc);
+
+    _mm_prefetch(row0 as *const i8, _MM_HINT_T0);
+    _mm_prefetch(row1 as *const i8, _MM_HINT_T0);
+    _mm_prefetch(row2 as *const i8, _MM_HINT_T0);
+    _mm_prefetch(row3 as *const i8, _MM_HINT_T0);
+    _mm_prefetch(row4 as *const i8, _MM_HINT_T0);
+    _mm_prefetch(row5 as *const i8, _MM_HINT_T0);
+
+    macro_rules! avx2_k_step {
+        ($a_ptr:expr, $b_ptr:expr) => {{
+            let b0 = _mm256_loadu_ps($b_ptr);
+            let b1 = _mm256_loadu_ps($b_ptr.add(8));
+
+            let a0 = _mm256_set1_ps(*$a_ptr);
+            c0 = _mm256_fmadd_ps(b0, a0, c0);
+            c6 = _mm256_fmadd_ps(b1, a0, c6);
+
+            let a1 = _mm256_set1_ps(*$a_ptr.add(1));
+            c1 = _mm256_fmadd_ps(b0, a1, c1);
+            c7 = _mm256_fmadd_ps(b1, a1, c7);
+
+            let a2 = _mm256_set1_ps(*$a_ptr.add(2));
+            c2 = _mm256_fmadd_ps(b0, a2, c2);
+            c8 = _mm256_fmadd_ps(b1, a2, c8);
+
+            let a3 = _mm256_set1_ps(*$a_ptr.add(3));
+            c3 = _mm256_fmadd_ps(b0, a3, c3);
+            c9 = _mm256_fmadd_ps(b1, a3, c9);
+
+            let a4 = _mm256_set1_ps(*$a_ptr.add(4));
+            c4 = _mm256_fmadd_ps(b0, a4, c4);
+            c10 = _mm256_fmadd_ps(b1, a4, c10);
+
+            let a5 = _mm256_set1_ps(*$a_ptr.add(5));
+            c5 = _mm256_fmadd_ps(b0, a5, c5);
+            c11 = _mm256_fmadd_ps(b1, a5, c11);
+        }};
+    }
+
+    const PREFETCH_K_DIST: usize = 8;
+    let kc_main = kc & !3;
+    let mut kk = 0usize;
+    let mut a_ptr = a;
+    let mut b_ptr = b;
+    while kk < kc_main {
+        if kk + PREFETCH_K_DIST < kc {
+            _mm_prefetch(b_ptr.add(PREFETCH_K_DIST * NR_AVX2) as *const i8, _MM_HINT_T0);
+            _mm_prefetch(a_ptr.add(PREFETCH_K_DIST * MR) as *const i8, _MM_HINT_T0);
+        }
+
+        avx2_k_step!(a_ptr, b_ptr);
+        a_ptr = a_ptr.add(MR);
+        b_ptr = b_ptr.add(NR_AVX2);
+
+        avx2_k_step!(a_ptr, b_ptr);
+        a_ptr = a_ptr.add(MR);
+        b_ptr = b_ptr.add(NR_AVX2);
+
+        avx2_k_step!(a_ptr, b_ptr);
+        a_ptr = a_ptr.add(MR);
+        b_ptr = b_ptr.add(NR_AVX2);
+
+        avx2_k_step!(a_ptr, b_ptr);
+        a_ptr = a_ptr.add(MR);
+        b_ptr = b_ptr.add(NR_AVX2);
+
+        kk += 4;
+    }
+    while kk < kc {
+        if kk + PREFETCH_K_DIST < kc {
+            _mm_prefetch(b_ptr.add(PREFETCH_K_DIST * NR_AVX2) as *const i8, _MM_HINT_T0);
+            _mm_prefetch(a_ptr.add(PREFETCH_K_DIST * MR) as *const i8, _MM_HINT_T0);
+        }
+        avx2_k_step!(a_ptr, b_ptr);
+        a_ptr = a_ptr.add(MR);
+        b_ptr = b_ptr.add(NR_AVX2);
+        kk += 1;
+    }
 
     let old0a = _mm256_loadu_ps(row0);
     let old0b = _mm256_loadu_ps(row0.add(8));
@@ -512,43 +707,90 @@ unsafe fn microkernel_6x32_avx512(
     let mut c10 = _mm512_setzero_ps();
     let mut c11 = _mm512_setzero_ps();
 
-    for kk in 0..kc {
-        // zmm12 / zmm13 at the ISA level.
-        let b0 = _mm512_loadu_ps(b.add(kk * NR_AVX512));
-        let b1 = _mm512_loadu_ps(b.add(kk * NR_AVX512 + 16));
-
-        // zmm14 broadcasts in sequence.
-        let a0 = _mm512_set1_ps(*a.add(kk * MR));
-        c0 = _mm512_fmadd_ps(b0, a0, c0);
-        c6 = _mm512_fmadd_ps(b1, a0, c6);
-
-        let a1 = _mm512_set1_ps(*a.add(kk * MR + 1));
-        c1 = _mm512_fmadd_ps(b0, a1, c1);
-        c7 = _mm512_fmadd_ps(b1, a1, c7);
-
-        let a2 = _mm512_set1_ps(*a.add(kk * MR + 2));
-        c2 = _mm512_fmadd_ps(b0, a2, c2);
-        c8 = _mm512_fmadd_ps(b1, a2, c8);
-
-        let a3 = _mm512_set1_ps(*a.add(kk * MR + 3));
-        c3 = _mm512_fmadd_ps(b0, a3, c3);
-        c9 = _mm512_fmadd_ps(b1, a3, c9);
-
-        let a4 = _mm512_set1_ps(*a.add(kk * MR + 4));
-        c4 = _mm512_fmadd_ps(b0, a4, c4);
-        c10 = _mm512_fmadd_ps(b1, a4, c10);
-
-        let a5 = _mm512_set1_ps(*a.add(kk * MR + 5));
-        c5 = _mm512_fmadd_ps(b0, a5, c5);
-        c11 = _mm512_fmadd_ps(b1, a5, c11);
-    }
-
     let row0 = c;
     let row1 = c.add(ldc);
     let row2 = c.add(2 * ldc);
     let row3 = c.add(3 * ldc);
     let row4 = c.add(4 * ldc);
     let row5 = c.add(5 * ldc);
+
+    _mm_prefetch(row0 as *const i8, _MM_HINT_T0);
+    _mm_prefetch(row1 as *const i8, _MM_HINT_T0);
+    _mm_prefetch(row2 as *const i8, _MM_HINT_T0);
+    _mm_prefetch(row3 as *const i8, _MM_HINT_T0);
+    _mm_prefetch(row4 as *const i8, _MM_HINT_T0);
+    _mm_prefetch(row5 as *const i8, _MM_HINT_T0);
+
+    macro_rules! avx512_k_step {
+        ($a_ptr:expr, $b_ptr:expr) => {{
+            let b0 = _mm512_loadu_ps($b_ptr);
+            let b1 = _mm512_loadu_ps($b_ptr.add(16));
+
+            let a0 = _mm512_set1_ps(*$a_ptr);
+            c0 = _mm512_fmadd_ps(b0, a0, c0);
+            c6 = _mm512_fmadd_ps(b1, a0, c6);
+
+            let a1 = _mm512_set1_ps(*$a_ptr.add(1));
+            c1 = _mm512_fmadd_ps(b0, a1, c1);
+            c7 = _mm512_fmadd_ps(b1, a1, c7);
+
+            let a2 = _mm512_set1_ps(*$a_ptr.add(2));
+            c2 = _mm512_fmadd_ps(b0, a2, c2);
+            c8 = _mm512_fmadd_ps(b1, a2, c8);
+
+            let a3 = _mm512_set1_ps(*$a_ptr.add(3));
+            c3 = _mm512_fmadd_ps(b0, a3, c3);
+            c9 = _mm512_fmadd_ps(b1, a3, c9);
+
+            let a4 = _mm512_set1_ps(*$a_ptr.add(4));
+            c4 = _mm512_fmadd_ps(b0, a4, c4);
+            c10 = _mm512_fmadd_ps(b1, a4, c10);
+
+            let a5 = _mm512_set1_ps(*$a_ptr.add(5));
+            c5 = _mm512_fmadd_ps(b0, a5, c5);
+            c11 = _mm512_fmadd_ps(b1, a5, c11);
+        }};
+    }
+
+    const PREFETCH_K_DIST: usize = 8;
+    let kc_main = kc & !3;
+    let mut kk = 0usize;
+    let mut a_ptr = a;
+    let mut b_ptr = b;
+    while kk < kc_main {
+        if kk + PREFETCH_K_DIST < kc {
+            _mm_prefetch(b_ptr.add(PREFETCH_K_DIST * NR_AVX512) as *const i8, _MM_HINT_T0);
+            _mm_prefetch(a_ptr.add(PREFETCH_K_DIST * MR) as *const i8, _MM_HINT_T0);
+        }
+
+        avx512_k_step!(a_ptr, b_ptr);
+        a_ptr = a_ptr.add(MR);
+        b_ptr = b_ptr.add(NR_AVX512);
+
+        avx512_k_step!(a_ptr, b_ptr);
+        a_ptr = a_ptr.add(MR);
+        b_ptr = b_ptr.add(NR_AVX512);
+
+        avx512_k_step!(a_ptr, b_ptr);
+        a_ptr = a_ptr.add(MR);
+        b_ptr = b_ptr.add(NR_AVX512);
+
+        avx512_k_step!(a_ptr, b_ptr);
+        a_ptr = a_ptr.add(MR);
+        b_ptr = b_ptr.add(NR_AVX512);
+
+        kk += 4;
+    }
+    while kk < kc {
+        if kk + PREFETCH_K_DIST < kc {
+            _mm_prefetch(b_ptr.add(PREFETCH_K_DIST * NR_AVX512) as *const i8, _MM_HINT_T0);
+            _mm_prefetch(a_ptr.add(PREFETCH_K_DIST * MR) as *const i8, _MM_HINT_T0);
+        }
+        avx512_k_step!(a_ptr, b_ptr);
+        a_ptr = a_ptr.add(MR);
+        b_ptr = b_ptr.add(NR_AVX512);
+        kk += 1;
+    }
 
     let old0a = _mm512_loadu_ps(row0);
     let old0b = _mm512_loadu_ps(row0.add(16));
@@ -585,17 +827,146 @@ fn maybe_log_tiling(kernel: KernelKind) {
     if std::env::var_os("FORGE_LOG_TILING").is_none() {
         return;
     }
+    let tiles = tile_blocks();
     TILING_LOG_ONCE.call_once(|| {
         eprintln!(
-            "[forge-std::matmul] kernel={kernel:?} mc={MC} kc={KC} nc={NC} mr={MR} nr_avx2={NR_AVX2} nr_avx512={NR_AVX512}"
+            "[forge-std::matmul] kernel={kernel:?} mc={} kc={} nc={} mr={MR} nr_avx2={NR_AVX2} nr_avx512={NR_AVX512}",
+            tiles.mc, tiles.kc, tiles.nc
         );
         eprintln!(
             "[forge-std::matmul] cache arithmetic: A_panel={}KB B_panel={}MB reg_tile={}B",
-            (MC * KC * 4) / 1024,
-            (KC * NC * 4) as f64 / (1024.0 * 1024.0),
+            (tiles.mc * tiles.kc * 4) / 1024,
+            (tiles.kc * tiles.nc * 4) as f64 / (1024.0 * 1024.0),
             MR * kernel.nr() * 4
         );
+        let (l2, l3) = detect_cache_sizes();
+        if let Some(l2_bytes) = l2 {
+            eprintln!("[forge-std::matmul] detected l2={}KB", l2_bytes / 1024);
+        }
+        if let Some(l3_bytes) = l3 {
+            eprintln!(
+                "[forge-std::matmul] detected l3={}MB",
+                l3_bytes / (1024 * 1024)
+            );
+        }
     });
+}
+
+#[inline(always)]
+fn tile_blocks() -> TileConfig {
+    *TILE_BLOCKS.get_or_init(|| {
+        let mut tiles = autotune_tiles();
+
+        if let Some(mc_env) = parse_env_usize("FORGE_MC") {
+            tiles.mc = align_down(mc_env.max(MR), MR).max(MR);
+        }
+        if let Some(kc_env) = parse_env_usize("FORGE_KC") {
+            tiles.kc = kc_env.max(1);
+        }
+        if let Some(nc_env) = parse_env_usize("FORGE_NC") {
+            tiles.nc = align_down(nc_env.max(NR_AVX2), NR_AVX2).max(NR_AVX2);
+        }
+
+        tiles
+    })
+}
+
+fn autotune_tiles() -> TileConfig {
+    let (l2, l3) = detect_cache_sizes();
+    let l2_bytes = l2.unwrap_or(512 * 1024);
+    let l3_bytes =
+        l3.unwrap_or(NC_DEFAULT * KC_DEFAULT * std::mem::size_of::<f32>() * 2);
+
+    let kc = if l2_bytes >= 2 * 1024 * 1024 {
+        384
+    } else if l2_bytes >= 512 * 1024 {
+        KC_DEFAULT
+    } else {
+        128
+    };
+
+    let l2_budget = l2_bytes / 2;
+    let mc_target = l2_budget / (kc * std::mem::size_of::<f32>());
+    let mc_pref = if l2_bytes >= 2 * 1024 * 1024 {
+        256
+    } else {
+        MC_DEFAULT
+    };
+    let mc = align_down(mc_target.min(mc_pref).max(MR * 4), MR).max(MR);
+
+    let l3_budget = (l3_bytes / 2).max(kc * NR_AVX2 * std::mem::size_of::<f32>());
+    let nc_target = l3_budget / (kc * std::mem::size_of::<f32>());
+    let nc = align_down(nc_target.clamp(512, 4096), NR_AVX2).max(NR_AVX2);
+
+    TileConfig { mc, kc, nc }
+}
+
+fn detect_cache_sizes() -> (Option<usize>, Option<usize>) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        use std::arch::x86_64::__cpuid_count;
+
+        let mut l2 = None;
+        let mut l3 = None;
+        for leaf in 0..8u32 {
+            // SAFETY: `cpuid` is available on x86_64 and this leaf/subleaf pair is query-only.
+            let regs = unsafe { __cpuid_count(4, leaf) };
+            let cache_type = regs.eax & 0x1F;
+            if cache_type == 0 {
+                break;
+            }
+
+            if cache_type != 1 && cache_type != 3 {
+                continue;
+            }
+
+            let level = (regs.eax >> 5) & 0x7;
+            let line_size = (regs.ebx & 0xFFF) + 1;
+            let partitions = ((regs.ebx >> 12) & 0x3FF) + 1;
+            let ways = ((regs.ebx >> 22) & 0x3FF) + 1;
+            let sets = regs.ecx + 1;
+            let size = (line_size as usize)
+                .saturating_mul(partitions as usize)
+                .saturating_mul(ways as usize)
+                .saturating_mul(sets as usize);
+
+            match level {
+                2 => l2 = Some(size),
+                3 => l3 = Some(size),
+                _ => {}
+            }
+        }
+
+        (l2, l3)
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        (None, None)
+    }
+}
+
+#[inline(always)]
+fn prefetch_t0(ptr: *const f32) {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        use std::arch::x86_64::*;
+        _mm_prefetch(ptr as *const i8, _MM_HINT_T0);
+    }
+
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = ptr;
+    }
+}
+
+#[inline(always)]
+const fn align_down(value: usize, align: usize) -> usize {
+    (value / align) * align
+}
+
+#[inline(always)]
+fn parse_env_usize(name: &str) -> Option<usize> {
+    std::env::var(name).ok()?.parse().ok()
 }
 
 #[inline(always)]
