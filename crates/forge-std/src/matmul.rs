@@ -10,6 +10,15 @@ const NC_DEFAULT: usize = 2048;
 const MR: usize = 6;
 const NR_AVX2: usize = 16;
 const NR_AVX512: usize = 32;
+const SMALL_GEMM_MAX_DIM: usize = 256;
+const SMALL_MC_MAX: usize = 128;
+const MR_SMALL: usize = 4;
+const NR_SMALL_AVX2: usize = 8;
+const NR_SMALL_AVX512: usize = 16;
+const MEDIUM_GEMM_MAX_DIM: usize = 512;
+const MEDIUM_KC_AVX2: usize = 224;
+const MEDIUM_KC_AVX512: usize = 256;
+const MEDIUM_MC_MAX: usize = 192;
 const PACK_ALIGN_BYTES: usize = 64;
 
 static TILING_LOG_ONCE: Once = Once::new();
@@ -28,6 +37,14 @@ impl KernelKind {
         match self {
             Self::Avx512 => NR_AVX512,
             Self::Avx2 | Self::Scalar => NR_AVX2,
+        }
+    }
+
+    #[inline(always)]
+    fn nr_small(self) -> usize {
+        match self {
+            Self::Avx512 => NR_SMALL_AVX512,
+            Self::Avx2 | Self::Scalar => NR_SMALL_AVX2,
         }
     }
 }
@@ -150,19 +167,20 @@ pub fn sgemm(
         return;
     }
 
-    if beta == 0.0 {
-        c.fill(0.0);
-    } else if beta != 1.0 {
+    if beta != 0.0 && beta != 1.0 {
         c.iter_mut().for_each(|v| *v *= beta);
     }
 
     if alpha == 0.0 {
+        if beta == 0.0 {
+            c.fill(0.0);
+        }
         return;
     }
 
     let kernel = select_kernel_for_problem(detect_kernel_kind(), m, n, k);
     maybe_log_tiling(kernel);
-    sgemm_with_kernel(a, b, c, m, n, k, alpha, kernel);
+    sgemm_with_kernel(a, b, c, m, n, k, alpha, beta == 0.0, kernel);
 }
 
 /// Compatibility wrapper for plain GEMM where `beta=0`.
@@ -174,8 +192,12 @@ pub fn matmul(a: &[f32], b: &[f32], c: &mut [f32], m: usize, n: usize, k: usize)
     assert_eq!(b.len(), k * n);
     assert_eq!(c.len(), m * n);
 
-    c.fill(0.0);
-    if m == 0 || n == 0 || k == 0 {
+    if m == 0 || n == 0 {
+        return;
+    }
+
+    if k == 0 {
+        c.fill(0.0);
         return;
     }
 
@@ -186,7 +208,7 @@ pub fn matmul(a: &[f32], b: &[f32], c: &mut [f32], m: usize, n: usize, k: usize)
 fn matmul_packed(a: &[f32], b: &[f32], c: &mut [f32], m: usize, n: usize, k: usize) {
     let kernel = select_kernel_for_problem(detect_kernel_kind(), m, n, k);
     maybe_log_tiling(kernel);
-    sgemm_with_kernel(a, b, c, m, n, k, 1.0, kernel);
+    sgemm_with_kernel(a, b, c, m, n, k, 1.0, true, kernel);
 }
 
 fn detect_kernel_kind() -> KernelKind {
@@ -223,7 +245,7 @@ fn select_kernel_for_problem(detected: KernelKind, m: usize, n: usize, k: usize)
 
     let problem = m.saturating_mul(n).saturating_mul(k);
     match detected {
-        KernelKind::Avx512 if problem < 512 * 512 * 512 => KernelKind::Avx2,
+        KernelKind::Avx512 if problem < 256 * 256 * 256 => KernelKind::Avx2,
         other => other,
     }
 }
@@ -237,19 +259,24 @@ fn sgemm_with_kernel(
     n: usize,
     k: usize,
     alpha: f32,
+    c_is_zeroed: bool,
     kernel: KernelKind,
 ) {
+    if m <= SMALL_GEMM_MAX_DIM && n <= SMALL_GEMM_MAX_DIM && k <= SMALL_GEMM_MAX_DIM {
+        sgemm_with_kernel_small(a, b, c, m, n, k, alpha, c_is_zeroed, kernel);
+        return;
+    }
+    if std::env::var_os("FORGE_DISABLE_MEDIUM_PATH").is_none()
+        && m <= MEDIUM_GEMM_MAX_DIM
+        && n <= MEDIUM_GEMM_MAX_DIM
+        && k <= MEDIUM_GEMM_MAX_DIM
+    {
+        sgemm_with_kernel_medium(a, b, c, m, n, k, alpha, c_is_zeroed, kernel);
+        return;
+    }
+
     let tiles = tile_blocks();
-    let low_core_client = std::thread::available_parallelism()
-        .map(|n| n.get() <= 4)
-        .unwrap_or(false);
-    let kc_block = if low_core_client && k >= 1024 {
-        // Large reductions on low-core client CPUs sustain better clocks
-        // with a shallower K block.
-        tiles.kc.min(128)
-    } else {
-        tiles.kc
-    };
+    let kc_block = tiles.kc;
     let nc_block = tiles.nc;
     let nr_actual = kernel.nr();
 
@@ -279,6 +306,7 @@ fn sgemm_with_kernel(
 
         for pc in (0..k).step_by(kc_block) {
             let kc = (k - pc).min(kc_block);
+            let accumulate_c = !(c_is_zeroed && pc == 0);
 
             let packed_b_len = div_ceil(nc, nr_actual) * kc * nr_actual;
             let packed_b = packed_b_buf.as_mut_slice(packed_b_len);
@@ -311,6 +339,7 @@ fn sgemm_with_kernel(
                             mc,
                             nc,
                             kc,
+                            accumulate_c,
                             nr_actual,
                             kernel,
                         );
@@ -320,6 +349,311 @@ fn sgemm_with_kernel(
     }
 
     debug_assert!(m * n == c.len());
+}
+
+#[allow(clippy::too_many_arguments)]
+fn sgemm_with_kernel_small(
+    a: &[f32],
+    b: &[f32],
+    c: &mut [f32],
+    m: usize,
+    n: usize,
+    k: usize,
+    alpha: f32,
+    c_is_zeroed: bool,
+    kernel: KernelKind,
+) {
+    let nr_actual = kernel.nr_small();
+    let kc_block = k;
+    let nc_block = n;
+
+    let num_threads = rayon::current_num_threads().max(1);
+    let target_chunks = num_threads.max(4);
+    let rows_per_chunk = align_down(div_ceil(m, target_chunks), MR_SMALL).max(MR_SMALL);
+    let mc_block = rows_per_chunk.min(SMALL_MC_MAX);
+
+    let mut packed_b_buf = AlignedPackBuffer::new(PACK_ALIGN_BYTES);
+    let packed_b_len = div_ceil(nc_block, nr_actual) * kc_block * nr_actual;
+    packed_b_buf.ensure_capacity(packed_b_len);
+    let packed_b = packed_b_buf.as_mut_slice(packed_b_len);
+    pack_b_with_nr(b, n, 0, 0, kc_block, nc_block, nr_actual, packed_b);
+    let packed_b: &[f32] = packed_b;
+    let accumulate_c = !c_is_zeroed;
+
+    let row_block_elems = n * mc_block;
+    c.par_chunks_mut(row_block_elems)
+        .enumerate()
+        .for_each(|(tile_i, c_rows)| {
+            let ic = tile_i * mc_block;
+            let mc = c_rows.len() / n;
+
+            PACK_A_BUF.with(|pack_a_buf| {
+                let mut pack_a_buf = pack_a_buf.borrow_mut();
+                let packed_a_len = div_ceil(mc, MR_SMALL) * kc_block * MR_SMALL;
+                let packed_a = pack_a_buf.as_mut_slice(packed_a_len);
+                pack_a_small(a, k, ic, 0, mc, kc_block, alpha, packed_a);
+
+                gebp_small(
+                    packed_a,
+                    packed_b,
+                    c_rows,
+                    n,
+                    0,
+                    mc,
+                    nc_block,
+                    kc_block,
+                    accumulate_c,
+                    nr_actual,
+                    kernel,
+                );
+            });
+        });
+
+    debug_assert!(m * n == c.len());
+}
+
+#[allow(clippy::too_many_arguments)]
+fn sgemm_with_kernel_medium(
+    a: &[f32],
+    b: &[f32],
+    c: &mut [f32],
+    m: usize,
+    n: usize,
+    k: usize,
+    alpha: f32,
+    c_is_zeroed: bool,
+    kernel: KernelKind,
+) {
+    let kc_default = match kernel {
+        KernelKind::Avx512 => MEDIUM_KC_AVX512,
+        KernelKind::Avx2 | KernelKind::Scalar => MEDIUM_KC_AVX2,
+    };
+    let kc_block = parse_env_usize("FORGE_MEDIUM_KC")
+        .unwrap_or(kc_default)
+        .clamp(1, k.max(1));
+    let nc_block = parse_env_usize("FORGE_MEDIUM_NC")
+        .unwrap_or(n)
+        .clamp(1, n.max(1));
+    let nr_actual = kernel.nr();
+
+    // Medium-size kernels still benefit from multiple row chunks,
+    // but avoid over-fragmenting the row panels.
+    let num_threads = rayon::current_num_threads().max(1);
+    let target_chunks = num_threads.max(2);
+    let rows_per_chunk = align_down(div_ceil(m, target_chunks), MR).max(MR);
+    let mc_block = parse_env_usize("FORGE_MEDIUM_MC")
+        .map(|v| align_down(v.max(MR), MR).max(MR))
+        .unwrap_or(rows_per_chunk.min(MEDIUM_MC_MAX).max(MR));
+
+    let max_kc = kc_block.min(k.max(1));
+    let max_nc = nc_block.min(n.max(1));
+    let mut packed_b_buf = AlignedPackBuffer::new(PACK_ALIGN_BYTES);
+    packed_b_buf.ensure_capacity(div_ceil(max_nc, nr_actual) * max_kc * nr_actual);
+
+    for jc in (0..n).step_by(nc_block) {
+        let nc = (n - jc).min(nc_block);
+
+        for pc in (0..k).step_by(kc_block) {
+            let kc = (k - pc).min(kc_block);
+            let accumulate_c = !(c_is_zeroed && pc == 0);
+
+            let packed_b_len = div_ceil(nc, nr_actual) * kc * nr_actual;
+            let packed_b = packed_b_buf.as_mut_slice(packed_b_len);
+            if nr_actual == NR_AVX512 {
+                pack_b_avx512(b, n, pc, jc, kc, nc, packed_b);
+            } else {
+                pack_b_avx2(b, n, pc, jc, kc, nc, packed_b);
+            }
+            let packed_b: &[f32] = packed_b;
+
+            let row_block_elems = n * mc_block;
+            c.par_chunks_mut(row_block_elems)
+                .enumerate()
+                .for_each(|(tile_i, c_rows)| {
+                    let ic = tile_i * mc_block;
+                    let mc = c_rows.len() / n;
+
+                    PACK_A_BUF.with(|pack_a_buf| {
+                        let mut pack_a_buf = pack_a_buf.borrow_mut();
+                        let packed_a_len = div_ceil(mc, MR) * kc * MR;
+                        let packed_a = pack_a_buf.as_mut_slice(packed_a_len);
+                        pack_a(a, k, ic, pc, mc, kc, alpha, packed_a);
+
+                        gebp(
+                            packed_a,
+                            packed_b,
+                            c_rows,
+                            n,
+                            jc,
+                            mc,
+                            nc,
+                            kc,
+                            accumulate_c,
+                            nr_actual,
+                            kernel,
+                        );
+                    });
+                });
+        }
+    }
+
+    debug_assert!(m * n == c.len());
+}
+
+#[inline]
+fn pack_a_small(
+    a: &[f32],
+    lda: usize,
+    ic: usize,
+    pc: usize,
+    mc: usize,
+    kc: usize,
+    alpha: f32,
+    packed_a: &mut [f32],
+) {
+    let m_panels = div_ceil(mc, MR_SMALL);
+    let alpha_is_one = alpha.to_bits() == 1.0f32.to_bits();
+    for ip in 0..m_panels {
+        let row_base = ip * MR_SMALL;
+        let panel_base = ip * kc * MR_SMALL;
+        if row_base + MR_SMALL <= mc {
+            for kk in 0..kc {
+                let src_col = pc + kk;
+                let dst_base = panel_base + kk * MR_SMALL;
+                if alpha_is_one {
+                    for ii in 0..MR_SMALL {
+                        packed_a[dst_base + ii] = a[(ic + row_base + ii) * lda + src_col];
+                    }
+                } else {
+                    for ii in 0..MR_SMALL {
+                        packed_a[dst_base + ii] =
+                            alpha * a[(ic + row_base + ii) * lda + src_col];
+                    }
+                }
+            }
+        } else {
+            for kk in 0..kc {
+                let src_col = pc + kk;
+                let dst_base = panel_base + kk * MR_SMALL;
+                for ii in 0..MR_SMALL {
+                    let row = row_base + ii;
+                    packed_a[dst_base + ii] = if row < mc {
+                        let value = a[(ic + row) * lda + src_col];
+                        if alpha_is_one {
+                            value
+                        } else {
+                            alpha * value
+                        }
+                    } else {
+                        0.0
+                    };
+                }
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn gebp_small(
+    packed_a: &[f32],
+    packed_b: &[f32],
+    c_rows: &mut [f32],
+    ldc: usize,
+    jc: usize,
+    mc: usize,
+    nc: usize,
+    kc: usize,
+    accumulate_c: bool,
+    nr_actual: usize,
+    kernel: KernelKind,
+) {
+    let m_panels = div_ceil(mc, MR_SMALL);
+    let n_panels = div_ceil(nc, nr_actual);
+
+    for ip in 0..m_panels {
+        let row = ip * MR_SMALL;
+        let a_panel = &packed_a[ip * kc * MR_SMALL..(ip + 1) * kc * MR_SMALL];
+
+        for jp in 0..n_panels {
+            let col = jp * nr_actual;
+            let b_panel = &packed_b[jp * kc * nr_actual..(jp + 1) * kc * nr_actual];
+            prefetch_t0(b_panel.as_ptr());
+            if jp + 1 < n_panels {
+                let next_panel_offset = (jp + 1) * kc * nr_actual;
+                prefetch_t0(unsafe { packed_b.as_ptr().add(next_panel_offset) });
+            }
+
+            let tile_m = (mc - row).min(MR_SMALL);
+            let tile_n = (nc - col).min(nr_actual);
+            let c_offset = row * ldc + (jc + col);
+
+            if tile_m == MR_SMALL && tile_n == nr_actual {
+                match kernel {
+                    KernelKind::Avx512 => {
+                        #[cfg(target_arch = "x86_64")]
+                        {
+                            unsafe {
+                                microkernel_4x16_avx512(
+                                    a_panel.as_ptr(),
+                                    b_panel.as_ptr(),
+                                    c_rows.as_mut_ptr().add(c_offset),
+                                    kc,
+                                    ldc,
+                                    accumulate_c,
+                                );
+                            }
+                        }
+                        #[cfg(not(target_arch = "x86_64"))]
+                        unreachable!("AVX-512 kernel is only selected on x86_64");
+                    }
+                    KernelKind::Avx2 => {
+                        #[cfg(target_arch = "x86_64")]
+                        {
+                            unsafe {
+                                microkernel_4x8_avx2(
+                                    a_panel.as_ptr(),
+                                    b_panel.as_ptr(),
+                                    c_rows.as_mut_ptr().add(c_offset),
+                                    kc,
+                                    ldc,
+                                    accumulate_c,
+                                );
+                            }
+                        }
+                        #[cfg(not(target_arch = "x86_64"))]
+                        unreachable!("AVX2 kernel is only selected on x86_64");
+                    }
+                    KernelKind::Scalar => unsafe {
+                        microkernel_scalar_edge_small(
+                            a_panel.as_ptr(),
+                            b_panel.as_ptr(),
+                            c_rows.as_mut_ptr().add(c_offset),
+                            kc,
+                            ldc,
+                            tile_m,
+                            tile_n,
+                            nr_actual,
+                            accumulate_c,
+                        );
+                    },
+                }
+            } else {
+                unsafe {
+                    microkernel_scalar_edge_small(
+                        a_panel.as_ptr(),
+                        b_panel.as_ptr(),
+                        c_rows.as_mut_ptr().add(c_offset),
+                        kc,
+                        ldc,
+                        tile_m,
+                        tile_n,
+                        nr_actual,
+                        accumulate_c,
+                    );
+                }
+            }
+        }
+    }
 }
 
 #[inline]
@@ -334,19 +668,41 @@ fn pack_a(
     packed_a: &mut [f32],
 ) {
     let m_panels = div_ceil(mc, MR);
+    let alpha_is_one = alpha.to_bits() == 1.0f32.to_bits();
     for ip in 0..m_panels {
         let row_base = ip * MR;
         let panel_base = ip * kc * MR;
-        for kk in 0..kc {
-            let src_col = pc + kk;
-            let dst_base = panel_base + kk * MR;
-            for ii in 0..MR {
-                let row = row_base + ii;
-                packed_a[dst_base + ii] = if row < mc {
-                    alpha * a[(ic + row) * lda + src_col]
+        if row_base + MR <= mc {
+            for kk in 0..kc {
+                let src_col = pc + kk;
+                let dst_base = panel_base + kk * MR;
+                if alpha_is_one {
+                    for ii in 0..MR {
+                        packed_a[dst_base + ii] = a[(ic + row_base + ii) * lda + src_col];
+                    }
                 } else {
-                    0.0
-                };
+                    for ii in 0..MR {
+                        packed_a[dst_base + ii] = alpha * a[(ic + row_base + ii) * lda + src_col];
+                    }
+                }
+            }
+        } else {
+            for kk in 0..kc {
+                let src_col = pc + kk;
+                let dst_base = panel_base + kk * MR;
+                for ii in 0..MR {
+                    let row = row_base + ii;
+                    packed_a[dst_base + ii] = if row < mc {
+                        let value = a[(ic + row) * lda + src_col];
+                        if alpha_is_one {
+                            value
+                        } else {
+                            alpha * value
+                        }
+                    } else {
+                        0.0
+                    };
+                }
             }
         }
     }
@@ -391,21 +747,33 @@ fn pack_b_with_nr(
 ) {
     let n_panels = div_ceil(nc, nr);
     let panel_stride = kc * nr;
-    for jp in 0..n_panels {
+    let full_panels = nc / nr;
+
+    for jp in 0..full_panels {
         let panel_base = jp * panel_stride;
         let panel = &mut packed_b[panel_base..panel_base + panel_stride];
         let col_base = jp * nr;
         for kk in 0..kc {
             let src_row = pc + kk;
             let dst_base = kk * nr;
-            for jj in 0..nr {
-                let col = col_base + jj;
-                panel[dst_base + jj] = if col < nc {
-                    b[src_row * ldb + (jc + col)]
-                } else {
-                    0.0
-                };
-            }
+            let src_base = src_row * ldb + jc + col_base;
+            panel[dst_base..dst_base + nr].copy_from_slice(&b[src_base..src_base + nr]);
+        }
+    }
+
+    if full_panels < n_panels {
+        let jp = full_panels;
+        let panel_base = jp * panel_stride;
+        let panel = &mut packed_b[panel_base..panel_base + panel_stride];
+        let col_base = jp * nr;
+        let edge_cols = nc - col_base;
+        for kk in 0..kc {
+            let src_row = pc + kk;
+            let dst_base = kk * nr;
+            let src_base = src_row * ldb + jc + col_base;
+            panel[dst_base..dst_base + edge_cols]
+                .copy_from_slice(&b[src_base..src_base + edge_cols]);
+            panel[dst_base + edge_cols..dst_base + nr].fill(0.0);
         }
     }
 }
@@ -420,6 +788,7 @@ fn gebp(
     mc: usize,
     nc: usize,
     kc: usize,
+    accumulate_c: bool,
     nr_actual: usize,
     kernel: KernelKind,
 ) {
@@ -457,6 +826,7 @@ fn gebp(
                                     c_rows.as_mut_ptr().add(c_offset),
                                     kc,
                                     ldc,
+                                    accumulate_c,
                                 );
                             }
                         }
@@ -475,6 +845,7 @@ fn gebp(
                                     c_rows.as_mut_ptr().add(c_offset),
                                     kc,
                                     ldc,
+                                    accumulate_c,
                                 );
                             }
                         }
@@ -493,6 +864,7 @@ fn gebp(
                                 tile_m,
                                 tile_n,
                                 nr_actual,
+                                accumulate_c,
                             );
                         }
                     }
@@ -509,10 +881,157 @@ fn gebp(
                         tile_m,
                         tile_n,
                         nr_actual,
+                        accumulate_c,
                     );
                 }
             }
         }
+    }
+}
+
+#[inline(always)]
+unsafe fn microkernel_scalar_edge_small(
+    a: *const f32,
+    b: *const f32,
+    c: *mut f32,
+    kc: usize,
+    ldc: usize,
+    m_tile: usize,
+    n_tile: usize,
+    nr_stride: usize,
+    accumulate_c: bool,
+) {
+    for ii in 0..m_tile {
+        for jj in 0..n_tile {
+            let mut acc = 0.0f32;
+            for kk in 0..kc {
+                let a_val = *a.add(kk * MR_SMALL + ii);
+                let b_val = *b.add(kk * nr_stride + jj);
+                acc += a_val * b_val;
+            }
+            let c_ptr = c.add(ii * ldc + jj);
+            if accumulate_c {
+                *c_ptr += acc;
+            } else {
+                *c_ptr = acc;
+            }
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+#[inline]
+unsafe fn microkernel_4x8_avx2(
+    a: *const f32,
+    b: *const f32,
+    c: *mut f32,
+    kc: usize,
+    ldc: usize,
+    accumulate_c: bool,
+) {
+    use std::arch::x86_64::*;
+
+    let mut c0 = _mm256_setzero_ps();
+    let mut c1 = _mm256_setzero_ps();
+    let mut c2 = _mm256_setzero_ps();
+    let mut c3 = _mm256_setzero_ps();
+
+    let row0 = c;
+    let row1 = c.add(ldc);
+    let row2 = c.add(2 * ldc);
+    let row3 = c.add(3 * ldc);
+
+    let mut a_ptr = a;
+    let mut b_ptr = b;
+    for _ in 0..kc {
+        let b0 = _mm256_loadu_ps(b_ptr);
+
+        let a0 = _mm256_set1_ps(*a_ptr);
+        c0 = _mm256_fmadd_ps(b0, a0, c0);
+        let a1 = _mm256_set1_ps(*a_ptr.add(1));
+        c1 = _mm256_fmadd_ps(b0, a1, c1);
+        let a2 = _mm256_set1_ps(*a_ptr.add(2));
+        c2 = _mm256_fmadd_ps(b0, a2, c2);
+        let a3 = _mm256_set1_ps(*a_ptr.add(3));
+        c3 = _mm256_fmadd_ps(b0, a3, c3);
+
+        a_ptr = a_ptr.add(MR_SMALL);
+        b_ptr = b_ptr.add(NR_SMALL_AVX2);
+    }
+
+    if accumulate_c {
+        let old0 = _mm256_loadu_ps(row0);
+        let old1 = _mm256_loadu_ps(row1);
+        let old2 = _mm256_loadu_ps(row2);
+        let old3 = _mm256_loadu_ps(row3);
+        _mm256_storeu_ps(row0, _mm256_add_ps(old0, c0));
+        _mm256_storeu_ps(row1, _mm256_add_ps(old1, c1));
+        _mm256_storeu_ps(row2, _mm256_add_ps(old2, c2));
+        _mm256_storeu_ps(row3, _mm256_add_ps(old3, c3));
+    } else {
+        _mm256_storeu_ps(row0, c0);
+        _mm256_storeu_ps(row1, c1);
+        _mm256_storeu_ps(row2, c2);
+        _mm256_storeu_ps(row3, c3);
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f")]
+#[inline]
+unsafe fn microkernel_4x16_avx512(
+    a: *const f32,
+    b: *const f32,
+    c: *mut f32,
+    kc: usize,
+    ldc: usize,
+    accumulate_c: bool,
+) {
+    use std::arch::x86_64::*;
+
+    let mut c0 = _mm512_setzero_ps();
+    let mut c1 = _mm512_setzero_ps();
+    let mut c2 = _mm512_setzero_ps();
+    let mut c3 = _mm512_setzero_ps();
+
+    let row0 = c;
+    let row1 = c.add(ldc);
+    let row2 = c.add(2 * ldc);
+    let row3 = c.add(3 * ldc);
+
+    let mut a_ptr = a;
+    let mut b_ptr = b;
+    for _ in 0..kc {
+        let b0 = _mm512_loadu_ps(b_ptr);
+
+        let a0 = _mm512_set1_ps(*a_ptr);
+        c0 = _mm512_fmadd_ps(b0, a0, c0);
+        let a1 = _mm512_set1_ps(*a_ptr.add(1));
+        c1 = _mm512_fmadd_ps(b0, a1, c1);
+        let a2 = _mm512_set1_ps(*a_ptr.add(2));
+        c2 = _mm512_fmadd_ps(b0, a2, c2);
+        let a3 = _mm512_set1_ps(*a_ptr.add(3));
+        c3 = _mm512_fmadd_ps(b0, a3, c3);
+
+        a_ptr = a_ptr.add(MR_SMALL);
+        b_ptr = b_ptr.add(NR_SMALL_AVX512);
+    }
+
+    if accumulate_c {
+        let old0 = _mm512_loadu_ps(row0);
+        let old1 = _mm512_loadu_ps(row1);
+        let old2 = _mm512_loadu_ps(row2);
+        let old3 = _mm512_loadu_ps(row3);
+        _mm512_storeu_ps(row0, _mm512_add_ps(old0, c0));
+        _mm512_storeu_ps(row1, _mm512_add_ps(old1, c1));
+        _mm512_storeu_ps(row2, _mm512_add_ps(old2, c2));
+        _mm512_storeu_ps(row3, _mm512_add_ps(old3, c3));
+    } else {
+        _mm512_storeu_ps(row0, c0);
+        _mm512_storeu_ps(row1, c1);
+        _mm512_storeu_ps(row2, c2);
+        _mm512_storeu_ps(row3, c3);
     }
 }
 
@@ -526,6 +1045,7 @@ unsafe fn microkernel_scalar_edge(
     m_tile: usize,
     n_tile: usize,
     nr_stride: usize,
+    accumulate_c: bool,
 ) {
     for ii in 0..m_tile {
         for jj in 0..n_tile {
@@ -536,7 +1056,11 @@ unsafe fn microkernel_scalar_edge(
                 acc += a_val * b_val;
             }
             let c_ptr = c.add(ii * ldc + jj);
-            *c_ptr += acc;
+            if accumulate_c {
+                *c_ptr += acc;
+            } else {
+                *c_ptr = acc;
+            }
         }
     }
 }
@@ -544,7 +1068,14 @@ unsafe fn microkernel_scalar_edge(
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
 #[inline]
-unsafe fn microkernel_6x16_avx2(a: *const f32, b: *const f32, c: *mut f32, kc: usize, ldc: usize) {
+unsafe fn microkernel_6x16_avx2(
+    a: *const f32,
+    b: *const f32,
+    c: *mut f32,
+    kc: usize,
+    ldc: usize,
+    accumulate_c: bool,
+) {
     use std::arch::x86_64::*;
 
     // ymm0..ymm5   -> C rows 0..5, cols 0..7
@@ -648,35 +1179,50 @@ unsafe fn microkernel_6x16_avx2(a: *const f32, b: *const f32, c: *mut f32, kc: u
         kk += 1;
     }
 
-    let old0a = _mm256_loadu_ps(row0);
-    let old0b = _mm256_loadu_ps(row0.add(8));
-    _mm256_storeu_ps(row0, _mm256_add_ps(old0a, c0));
-    _mm256_storeu_ps(row0.add(8), _mm256_add_ps(old0b, c6));
+    if accumulate_c {
+        let old0a = _mm256_loadu_ps(row0);
+        let old0b = _mm256_loadu_ps(row0.add(8));
+        _mm256_storeu_ps(row0, _mm256_add_ps(old0a, c0));
+        _mm256_storeu_ps(row0.add(8), _mm256_add_ps(old0b, c6));
 
-    let old1a = _mm256_loadu_ps(row1);
-    let old1b = _mm256_loadu_ps(row1.add(8));
-    _mm256_storeu_ps(row1, _mm256_add_ps(old1a, c1));
-    _mm256_storeu_ps(row1.add(8), _mm256_add_ps(old1b, c7));
+        let old1a = _mm256_loadu_ps(row1);
+        let old1b = _mm256_loadu_ps(row1.add(8));
+        _mm256_storeu_ps(row1, _mm256_add_ps(old1a, c1));
+        _mm256_storeu_ps(row1.add(8), _mm256_add_ps(old1b, c7));
 
-    let old2a = _mm256_loadu_ps(row2);
-    let old2b = _mm256_loadu_ps(row2.add(8));
-    _mm256_storeu_ps(row2, _mm256_add_ps(old2a, c2));
-    _mm256_storeu_ps(row2.add(8), _mm256_add_ps(old2b, c8));
+        let old2a = _mm256_loadu_ps(row2);
+        let old2b = _mm256_loadu_ps(row2.add(8));
+        _mm256_storeu_ps(row2, _mm256_add_ps(old2a, c2));
+        _mm256_storeu_ps(row2.add(8), _mm256_add_ps(old2b, c8));
 
-    let old3a = _mm256_loadu_ps(row3);
-    let old3b = _mm256_loadu_ps(row3.add(8));
-    _mm256_storeu_ps(row3, _mm256_add_ps(old3a, c3));
-    _mm256_storeu_ps(row3.add(8), _mm256_add_ps(old3b, c9));
+        let old3a = _mm256_loadu_ps(row3);
+        let old3b = _mm256_loadu_ps(row3.add(8));
+        _mm256_storeu_ps(row3, _mm256_add_ps(old3a, c3));
+        _mm256_storeu_ps(row3.add(8), _mm256_add_ps(old3b, c9));
 
-    let old4a = _mm256_loadu_ps(row4);
-    let old4b = _mm256_loadu_ps(row4.add(8));
-    _mm256_storeu_ps(row4, _mm256_add_ps(old4a, c4));
-    _mm256_storeu_ps(row4.add(8), _mm256_add_ps(old4b, c10));
+        let old4a = _mm256_loadu_ps(row4);
+        let old4b = _mm256_loadu_ps(row4.add(8));
+        _mm256_storeu_ps(row4, _mm256_add_ps(old4a, c4));
+        _mm256_storeu_ps(row4.add(8), _mm256_add_ps(old4b, c10));
 
-    let old5a = _mm256_loadu_ps(row5);
-    let old5b = _mm256_loadu_ps(row5.add(8));
-    _mm256_storeu_ps(row5, _mm256_add_ps(old5a, c5));
-    _mm256_storeu_ps(row5.add(8), _mm256_add_ps(old5b, c11));
+        let old5a = _mm256_loadu_ps(row5);
+        let old5b = _mm256_loadu_ps(row5.add(8));
+        _mm256_storeu_ps(row5, _mm256_add_ps(old5a, c5));
+        _mm256_storeu_ps(row5.add(8), _mm256_add_ps(old5b, c11));
+    } else {
+        _mm256_storeu_ps(row0, c0);
+        _mm256_storeu_ps(row0.add(8), c6);
+        _mm256_storeu_ps(row1, c1);
+        _mm256_storeu_ps(row1.add(8), c7);
+        _mm256_storeu_ps(row2, c2);
+        _mm256_storeu_ps(row2.add(8), c8);
+        _mm256_storeu_ps(row3, c3);
+        _mm256_storeu_ps(row3.add(8), c9);
+        _mm256_storeu_ps(row4, c4);
+        _mm256_storeu_ps(row4.add(8), c10);
+        _mm256_storeu_ps(row5, c5);
+        _mm256_storeu_ps(row5.add(8), c11);
+    }
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -688,6 +1234,7 @@ unsafe fn microkernel_6x32_avx512(
     c: *mut f32,
     kc: usize,
     ldc: usize,
+    accumulate_c: bool,
 ) {
     use std::arch::x86_64::*;
 
@@ -792,35 +1339,50 @@ unsafe fn microkernel_6x32_avx512(
         kk += 1;
     }
 
-    let old0a = _mm512_loadu_ps(row0);
-    let old0b = _mm512_loadu_ps(row0.add(16));
-    _mm512_storeu_ps(row0, _mm512_add_ps(old0a, c0));
-    _mm512_storeu_ps(row0.add(16), _mm512_add_ps(old0b, c6));
+    if accumulate_c {
+        let old0a = _mm512_loadu_ps(row0);
+        let old0b = _mm512_loadu_ps(row0.add(16));
+        _mm512_storeu_ps(row0, _mm512_add_ps(old0a, c0));
+        _mm512_storeu_ps(row0.add(16), _mm512_add_ps(old0b, c6));
 
-    let old1a = _mm512_loadu_ps(row1);
-    let old1b = _mm512_loadu_ps(row1.add(16));
-    _mm512_storeu_ps(row1, _mm512_add_ps(old1a, c1));
-    _mm512_storeu_ps(row1.add(16), _mm512_add_ps(old1b, c7));
+        let old1a = _mm512_loadu_ps(row1);
+        let old1b = _mm512_loadu_ps(row1.add(16));
+        _mm512_storeu_ps(row1, _mm512_add_ps(old1a, c1));
+        _mm512_storeu_ps(row1.add(16), _mm512_add_ps(old1b, c7));
 
-    let old2a = _mm512_loadu_ps(row2);
-    let old2b = _mm512_loadu_ps(row2.add(16));
-    _mm512_storeu_ps(row2, _mm512_add_ps(old2a, c2));
-    _mm512_storeu_ps(row2.add(16), _mm512_add_ps(old2b, c8));
+        let old2a = _mm512_loadu_ps(row2);
+        let old2b = _mm512_loadu_ps(row2.add(16));
+        _mm512_storeu_ps(row2, _mm512_add_ps(old2a, c2));
+        _mm512_storeu_ps(row2.add(16), _mm512_add_ps(old2b, c8));
 
-    let old3a = _mm512_loadu_ps(row3);
-    let old3b = _mm512_loadu_ps(row3.add(16));
-    _mm512_storeu_ps(row3, _mm512_add_ps(old3a, c3));
-    _mm512_storeu_ps(row3.add(16), _mm512_add_ps(old3b, c9));
+        let old3a = _mm512_loadu_ps(row3);
+        let old3b = _mm512_loadu_ps(row3.add(16));
+        _mm512_storeu_ps(row3, _mm512_add_ps(old3a, c3));
+        _mm512_storeu_ps(row3.add(16), _mm512_add_ps(old3b, c9));
 
-    let old4a = _mm512_loadu_ps(row4);
-    let old4b = _mm512_loadu_ps(row4.add(16));
-    _mm512_storeu_ps(row4, _mm512_add_ps(old4a, c4));
-    _mm512_storeu_ps(row4.add(16), _mm512_add_ps(old4b, c10));
+        let old4a = _mm512_loadu_ps(row4);
+        let old4b = _mm512_loadu_ps(row4.add(16));
+        _mm512_storeu_ps(row4, _mm512_add_ps(old4a, c4));
+        _mm512_storeu_ps(row4.add(16), _mm512_add_ps(old4b, c10));
 
-    let old5a = _mm512_loadu_ps(row5);
-    let old5b = _mm512_loadu_ps(row5.add(16));
-    _mm512_storeu_ps(row5, _mm512_add_ps(old5a, c5));
-    _mm512_storeu_ps(row5.add(16), _mm512_add_ps(old5b, c11));
+        let old5a = _mm512_loadu_ps(row5);
+        let old5b = _mm512_loadu_ps(row5.add(16));
+        _mm512_storeu_ps(row5, _mm512_add_ps(old5a, c5));
+        _mm512_storeu_ps(row5.add(16), _mm512_add_ps(old5b, c11));
+    } else {
+        _mm512_storeu_ps(row0, c0);
+        _mm512_storeu_ps(row0.add(16), c6);
+        _mm512_storeu_ps(row1, c1);
+        _mm512_storeu_ps(row1.add(16), c7);
+        _mm512_storeu_ps(row2, c2);
+        _mm512_storeu_ps(row2.add(16), c8);
+        _mm512_storeu_ps(row3, c3);
+        _mm512_storeu_ps(row3.add(16), c9);
+        _mm512_storeu_ps(row4, c4);
+        _mm512_storeu_ps(row4.add(16), c10);
+        _mm512_storeu_ps(row5, c5);
+        _mm512_storeu_ps(row5.add(16), c11);
+    }
 }
 
 fn maybe_log_tiling(kernel: KernelKind) {
@@ -1123,8 +1685,18 @@ mod tests {
             let mut c_avx2 = vec![0.0f32; n * n];
             let mut c_avx512 = vec![0.0f32; n * n];
 
-            sgemm_with_kernel(&a, &b, &mut c_avx2, n, n, n, 1.0, KernelKind::Avx2);
-            sgemm_with_kernel(&a, &b, &mut c_avx512, n, n, n, 1.0, KernelKind::Avx512);
+            sgemm_with_kernel(&a, &b, &mut c_avx2, n, n, n, 1.0, true, KernelKind::Avx2);
+            sgemm_with_kernel(
+                &a,
+                &b,
+                &mut c_avx512,
+                n,
+                n,
+                n,
+                1.0,
+                true,
+                KernelKind::Avx512,
+            );
 
             assert!(max_abs_diff(&c_avx2, &c_avx512) < 1e-3);
         }
