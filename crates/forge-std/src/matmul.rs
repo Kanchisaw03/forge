@@ -10,7 +10,7 @@ const NC_DEFAULT: usize = 2048;
 const MR: usize = 6;
 const NR_AVX2: usize = 16;
 const NR_AVX512: usize = 32;
-const SMALL_GEMM_MAX_DIM: usize = 256;
+const SMALL_GEMM_MAX_DIM: usize = 192;
 const SMALL_MC_MAX: usize = 128;
 const MR_SMALL: usize = 4;
 const NR_SMALL_AVX2: usize = 8;
@@ -19,10 +19,25 @@ const MEDIUM_GEMM_MAX_DIM: usize = 512;
 const MEDIUM_KC_AVX2: usize = 224;
 const MEDIUM_KC_AVX512: usize = 256;
 const MEDIUM_MC_MAX: usize = 192;
+const MEDIUM_MC_AVX512_512_TUNED: usize = 156;
+const SMALL_PARALLEL_MIN_FLOPS: usize = 24 * 1024 * 1024;
+const MEDIUM_PARALLEL_MIN_FLOPS: usize = 48 * 1024 * 1024;
+const EDGE_AWARE_KC: usize = 160;
+const SMALL_DIRECT_MAX_DIM: usize = 128;
+const SMALL_DIRECT_MAX_FLOPS: usize =
+    SMALL_DIRECT_MAX_DIM * SMALL_DIRECT_MAX_DIM * SMALL_DIRECT_MAX_DIM;
+const PACK_B_PAR_MIN_WORK: usize = 192 * 1024;
 const PACK_ALIGN_BYTES: usize = 64;
+const AVX512_DOWNSHIFT_FLOPS: usize = 192 * 192 * 192;
 
 static TILING_LOG_ONCE: Once = Once::new();
 static TILE_BLOCKS: OnceLock<TileConfig> = OnceLock::new();
+static FORCE_AVX512: OnceLock<bool> = OnceLock::new();
+static FORCE_AVX2: OnceLock<bool> = OnceLock::new();
+static DISABLE_AVX512: OnceLock<bool> = OnceLock::new();
+static DISABLE_MEDIUM_PATH: OnceLock<bool> = OnceLock::new();
+static DISABLE_DIRECT_SMALL: OnceLock<bool> = OnceLock::new();
+static LOG_TILING: OnceLock<bool> = OnceLock::new();
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum KernelKind {
@@ -225,8 +240,67 @@ fn detect_kernel_kind() -> KernelKind {
 }
 
 #[inline(always)]
+fn cached_env_flag(lock: &OnceLock<bool>, name: &str) -> bool {
+    *lock.get_or_init(|| std::env::var_os(name).is_some())
+}
+
+#[inline(always)]
+fn use_direct_small_path(m: usize, n: usize, k: usize, kernel: KernelKind) -> bool {
+    if kernel == KernelKind::Scalar {
+        return false;
+    }
+    if cached_env_flag(&DISABLE_DIRECT_SMALL, "FORGE_DISABLE_DIRECT_SMALL") {
+        return false;
+    }
+    m <= SMALL_DIRECT_MAX_DIM
+        && n <= SMALL_DIRECT_MAX_DIM
+        && k <= SMALL_DIRECT_MAX_DIM
+        && m.saturating_mul(n).saturating_mul(k) <= SMALL_DIRECT_MAX_FLOPS
+}
+
+#[inline(always)]
+fn balanced_mc_block(m: usize, mc_cap: usize, panel_rows: usize) -> usize {
+    if m == 0 {
+        return mc_cap.max(panel_rows);
+    }
+
+    let threads = rayon::current_num_threads().max(1);
+    let mut chunks = div_ceil(m, mc_cap.max(panel_rows)).max(threads);
+    let rem = chunks % threads;
+    if rem != 0 {
+        chunks += threads - rem;
+    }
+
+    let rows_per_chunk = align_down(div_ceil(m, chunks), panel_rows).max(panel_rows);
+    rows_per_chunk.min(mc_cap.max(panel_rows))
+}
+
+#[inline(always)]
+fn tuned_medium_mc(m: usize, n: usize, k: usize, kernel: KernelKind) -> usize {
+    if matches!(kernel, KernelKind::Avx512) && m >= 448 && n >= 448 && k >= 448 {
+        return align_down(MEDIUM_MC_AVX512_512_TUNED.max(MR), MR).max(MR);
+    }
+    balanced_mc_block(m, MEDIUM_MC_MAX, MR)
+}
+
+#[inline(always)]
+fn edge_aware_kc(kc_block: usize, n: usize, k: usize, nr_actual: usize, kernel: KernelKind) -> usize {
+    if !matches!(kernel, KernelKind::Avx512) {
+        return kc_block;
+    }
+    if kc_block <= EDGE_AWARE_KC {
+        return kc_block;
+    }
+    // Odd-width/odd-K problems (e.g. 1028) benefit from a slightly smaller KC on Tiger Lake.
+    if (n % nr_actual != 0) || (k % 64 != 0) {
+        return EDGE_AWARE_KC;
+    }
+    kc_block
+}
+
+#[inline(always)]
 fn select_kernel_for_problem(detected: KernelKind, m: usize, n: usize, k: usize) -> KernelKind {
-    if std::env::var_os("FORGE_FORCE_AVX512").is_some() {
+    if cached_env_flag(&FORCE_AVX512, "FORGE_FORCE_AVX512") {
         return if detected == KernelKind::Avx512 {
             KernelKind::Avx512
         } else {
@@ -234,8 +308,8 @@ fn select_kernel_for_problem(detected: KernelKind, m: usize, n: usize, k: usize)
         };
     }
 
-    if std::env::var_os("FORGE_FORCE_AVX2").is_some()
-        || std::env::var_os("FORGE_DISABLE_AVX512").is_some()
+    if cached_env_flag(&FORCE_AVX2, "FORGE_FORCE_AVX2")
+        || cached_env_flag(&DISABLE_AVX512, "FORGE_DISABLE_AVX512")
     {
         return match detected {
             KernelKind::Avx512 | KernelKind::Avx2 => KernelKind::Avx2,
@@ -245,7 +319,8 @@ fn select_kernel_for_problem(detected: KernelKind, m: usize, n: usize, k: usize)
 
     let problem = m.saturating_mul(n).saturating_mul(k);
     match detected {
-        KernelKind::Avx512 if problem < 256 * 256 * 256 => KernelKind::Avx2,
+        // Keep AVX2 only for very small matrices where AVX-512 setup cost can dominate.
+        KernelKind::Avx512 if problem < AVX512_DOWNSHIFT_FLOPS => KernelKind::Avx2,
         other => other,
     }
 }
@@ -263,10 +338,14 @@ fn sgemm_with_kernel(
     kernel: KernelKind,
 ) {
     if m <= SMALL_GEMM_MAX_DIM && n <= SMALL_GEMM_MAX_DIM && k <= SMALL_GEMM_MAX_DIM {
+        if use_direct_small_path(m, n, k, kernel) {
+            sgemm_direct_small(a, b, c, m, n, k, alpha, c_is_zeroed, kernel);
+            return;
+        }
         sgemm_with_kernel_small(a, b, c, m, n, k, alpha, c_is_zeroed, kernel);
         return;
     }
-    if std::env::var_os("FORGE_DISABLE_MEDIUM_PATH").is_none()
+    if !cached_env_flag(&DISABLE_MEDIUM_PATH, "FORGE_DISABLE_MEDIUM_PATH")
         && m <= MEDIUM_GEMM_MAX_DIM
         && n <= MEDIUM_GEMM_MAX_DIM
         && k <= MEDIUM_GEMM_MAX_DIM
@@ -276,30 +355,19 @@ fn sgemm_with_kernel(
     }
 
     let tiles = tile_blocks();
-    let kc_block = tiles.kc;
+    let kc_block = edge_aware_kc(tiles.kc, n, k, kernel.nr(), kernel);
     let nc_block = tiles.nc;
     let nr_actual = kernel.nr();
 
-    // Dynamically shrink MC so we get enough parallel chunks for all cores
-    // while keeping each chunk large enough for cache efficiency.
-    let num_threads = rayon::current_num_threads().max(1);
-    let min_chunks = if num_threads > 2 && m <= 256 {
-        2
-    } else {
-        num_threads.max(4)
-    };
-    let mc_block = if m > 0 {
-        let mc_max = tiles.mc;
-        let mc_for_balance = align_down((m + min_chunks - 1) / min_chunks, MR).max(MR);
-        mc_max.min(mc_for_balance)
-    } else {
-        tiles.mc
-    };
+    // Choose MC so row chunks stay aligned to MR and task count tracks thread count.
+    let mc_block = balanced_mc_block(m, tiles.mc, MR);
 
     let max_kc = kc_block.min(k.max(1));
     let max_nc = nc_block.min(n.max(1));
     let mut packed_b_buf = AlignedPackBuffer::new(PACK_ALIGN_BYTES);
     packed_b_buf.ensure_capacity(div_ceil(max_nc, nr_actual) * max_kc * nr_actual);
+    let use_parallel = rayon::current_num_threads() > 1
+        && m.saturating_mul(n).saturating_mul(k) >= MEDIUM_PARALLEL_MIN_FLOPS;
 
     for jc in (0..n).step_by(nc_block) {
         let nc = (n - jc).min(nc_block);
@@ -318,9 +386,36 @@ fn sgemm_with_kernel(
             let packed_b: &[f32] = packed_b;
 
             let row_block_elems = n * mc_block;
-            c.par_chunks_mut(row_block_elems)
-                .enumerate()
-                .for_each(|(tile_i, c_rows)| {
+            if use_parallel {
+                c.par_chunks_mut(row_block_elems)
+                    .enumerate()
+                    .for_each(|(tile_i, c_rows)| {
+                        let ic = tile_i * mc_block;
+                        let mc = c_rows.len() / n;
+
+                        PACK_A_BUF.with(|pack_a_buf| {
+                            let mut pack_a_buf = pack_a_buf.borrow_mut();
+                            let packed_a_len = div_ceil(mc, MR) * kc * MR;
+                            let packed_a = pack_a_buf.as_mut_slice(packed_a_len);
+                            pack_a(a, k, ic, pc, mc, kc, alpha, packed_a);
+
+                            gebp(
+                                packed_a,
+                                packed_b,
+                                c_rows,
+                                n,
+                                jc,
+                                mc,
+                                nc,
+                                kc,
+                                accumulate_c,
+                                nr_actual,
+                                kernel,
+                            );
+                        });
+                    });
+            } else {
+                for (tile_i, c_rows) in c.chunks_mut(row_block_elems).enumerate() {
                     let ic = tile_i * mc_block;
                     let mc = c_rows.len() / n;
 
@@ -344,11 +439,141 @@ fn sgemm_with_kernel(
                             kernel,
                         );
                     });
-                });
+                }
+            }
         }
     }
 
     debug_assert!(m * n == c.len());
+}
+
+#[allow(clippy::too_many_arguments)]
+fn sgemm_direct_small(
+    a: &[f32],
+    b: &[f32],
+    c: &mut [f32],
+    m: usize,
+    n: usize,
+    k: usize,
+    alpha: f32,
+    c_is_zeroed: bool,
+    kernel: KernelKind,
+) {
+    let accumulate_c = !c_is_zeroed;
+
+    match kernel {
+        KernelKind::Scalar => unsafe {
+            microkernel_scalar_edge_direct(
+                a.as_ptr(),
+                b.as_ptr(),
+                c.as_mut_ptr(),
+                k,
+                k,
+                n,
+                n,
+                m,
+                n,
+                alpha,
+                accumulate_c,
+            );
+        },
+        KernelKind::Avx512 => {
+            for i in (0..m).step_by(MR) {
+                let tile_m = (m - i).min(MR);
+                let a_tile = unsafe { a.as_ptr().add(i * k) };
+                let c_tile_row = unsafe { c.as_mut_ptr().add(i * n) };
+
+                for j in (0..n).step_by(NR_AVX512) {
+                    let tile_n = (n - j).min(NR_AVX512);
+                    let b_tile = unsafe { b.as_ptr().add(j) };
+                    let c_tile = unsafe { c_tile_row.add(j) };
+
+                    if tile_m == MR && tile_n == NR_AVX512 {
+                        #[cfg(target_arch = "x86_64")]
+                        unsafe {
+                            microkernel_6x32_direct_avx512(
+                                a_tile,
+                                b_tile,
+                                c_tile,
+                                k,
+                                k,
+                                n,
+                                n,
+                                alpha,
+                                accumulate_c,
+                            );
+                        }
+                        #[cfg(not(target_arch = "x86_64"))]
+                        unreachable!("AVX-512 kernel is only selected on x86_64");
+                    } else {
+                        unsafe {
+                            microkernel_scalar_edge_direct(
+                                a_tile,
+                                b_tile,
+                                c_tile,
+                                k,
+                                k,
+                                n,
+                                n,
+                                tile_m,
+                                tile_n,
+                                alpha,
+                                accumulate_c,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        KernelKind::Avx2 => {
+            for i in (0..m).step_by(MR) {
+                let tile_m = (m - i).min(MR);
+                let a_tile = unsafe { a.as_ptr().add(i * k) };
+                let c_tile_row = unsafe { c.as_mut_ptr().add(i * n) };
+
+                for j in (0..n).step_by(NR_AVX2) {
+                    let tile_n = (n - j).min(NR_AVX2);
+                    let b_tile = unsafe { b.as_ptr().add(j) };
+                    let c_tile = unsafe { c_tile_row.add(j) };
+
+                    if tile_m == MR && tile_n == NR_AVX2 {
+                        #[cfg(target_arch = "x86_64")]
+                        unsafe {
+                            microkernel_6x16_direct_avx2(
+                                a_tile,
+                                b_tile,
+                                c_tile,
+                                k,
+                                k,
+                                n,
+                                n,
+                                alpha,
+                                accumulate_c,
+                            );
+                        }
+                        #[cfg(not(target_arch = "x86_64"))]
+                        unreachable!("AVX2 kernel is only selected on x86_64");
+                    } else {
+                        unsafe {
+                            microkernel_scalar_edge_direct(
+                                a_tile,
+                                b_tile,
+                                c_tile,
+                                k,
+                                k,
+                                n,
+                                n,
+                                tile_m,
+                                tile_n,
+                                alpha,
+                                accumulate_c,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -381,9 +606,39 @@ fn sgemm_with_kernel_small(
     let accumulate_c = !c_is_zeroed;
 
     let row_block_elems = n * mc_block;
-    c.par_chunks_mut(row_block_elems)
-        .enumerate()
-        .for_each(|(tile_i, c_rows)| {
+    let use_parallel = rayon::current_num_threads() > 1
+        && m.saturating_mul(n).saturating_mul(k) >= SMALL_PARALLEL_MIN_FLOPS;
+
+    if use_parallel {
+        c.par_chunks_mut(row_block_elems)
+            .enumerate()
+            .for_each(|(tile_i, c_rows)| {
+                let ic = tile_i * mc_block;
+                let mc = c_rows.len() / n;
+
+                PACK_A_BUF.with(|pack_a_buf| {
+                    let mut pack_a_buf = pack_a_buf.borrow_mut();
+                    let packed_a_len = div_ceil(mc, MR_SMALL) * kc_block * MR_SMALL;
+                    let packed_a = pack_a_buf.as_mut_slice(packed_a_len);
+                    pack_a_small(a, k, ic, 0, mc, kc_block, alpha, packed_a);
+
+                    gebp_small(
+                        packed_a,
+                        packed_b,
+                        c_rows,
+                        n,
+                        0,
+                        mc,
+                        nc_block,
+                        kc_block,
+                        accumulate_c,
+                        nr_actual,
+                        kernel,
+                    );
+                });
+            });
+    } else {
+        for (tile_i, c_rows) in c.chunks_mut(row_block_elems).enumerate() {
             let ic = tile_i * mc_block;
             let mc = c_rows.len() / n;
 
@@ -407,7 +662,8 @@ fn sgemm_with_kernel_small(
                     kernel,
                 );
             });
-        });
+        }
+    }
 
     debug_assert!(m * n == c.len());
 }
@@ -438,12 +694,9 @@ fn sgemm_with_kernel_medium(
 
     // Medium-size kernels still benefit from multiple row chunks,
     // but avoid over-fragmenting the row panels.
-    let num_threads = rayon::current_num_threads().max(1);
-    let target_chunks = num_threads.max(2);
-    let rows_per_chunk = align_down(div_ceil(m, target_chunks), MR).max(MR);
     let mc_block = parse_env_usize("FORGE_MEDIUM_MC")
         .map(|v| align_down(v.max(MR), MR).max(MR))
-        .unwrap_or(rows_per_chunk.min(MEDIUM_MC_MAX).max(MR));
+        .unwrap_or(tuned_medium_mc(m, n, k, kernel));
 
     let max_kc = kc_block.min(k.max(1));
     let max_nc = nc_block.min(n.max(1));
@@ -638,18 +891,34 @@ fn gebp_small(
                     },
                 }
             } else {
-                unsafe {
-                    microkernel_scalar_edge_small(
-                        a_panel.as_ptr(),
-                        b_panel.as_ptr(),
-                        c_rows.as_mut_ptr().add(c_offset),
-                        kc,
-                        ldc,
-                        tile_m,
-                        tile_n,
-                        nr_actual,
-                        accumulate_c,
-                    );
+                match kernel {
+                    KernelKind::Avx512 | KernelKind::Avx2 => unsafe {
+                        microkernel_edge_tile_fast_small(
+                            a_panel.as_ptr(),
+                            b_panel.as_ptr(),
+                            c_rows.as_mut_ptr().add(c_offset),
+                            kc,
+                            ldc,
+                            tile_m,
+                            tile_n,
+                            nr_actual,
+                            accumulate_c,
+                            kernel,
+                        );
+                    },
+                    KernelKind::Scalar => unsafe {
+                        microkernel_scalar_edge_small(
+                            a_panel.as_ptr(),
+                            b_panel.as_ptr(),
+                            c_rows.as_mut_ptr().add(c_offset),
+                            kc,
+                            ldc,
+                            tile_m,
+                            tile_n,
+                            nr_actual,
+                            accumulate_c,
+                        );
+                    },
                 }
             }
         }
@@ -747,34 +1016,205 @@ fn pack_b_with_nr(
 ) {
     let n_panels = div_ceil(nc, nr);
     let panel_stride = kc * nr;
-    let full_panels = nc / nr;
 
-    for jp in 0..full_panels {
+    if should_parallel_pack_b(kc, nc, nr) {
+        packed_b
+            .par_chunks_mut(panel_stride)
+            .enumerate()
+            .for_each(|(jp, panel)| {
+                pack_b_panel(b, ldb, pc, jc, kc, nc, nr, jp, panel);
+            });
+        return;
+    }
+
+    for jp in 0..n_panels {
         let panel_base = jp * panel_stride;
         let panel = &mut packed_b[panel_base..panel_base + panel_stride];
-        let col_base = jp * nr;
-        for kk in 0..kc {
-            let src_row = pc + kk;
-            let dst_base = kk * nr;
-            let src_base = src_row * ldb + jc + col_base;
-            panel[dst_base..dst_base + nr].copy_from_slice(&b[src_base..src_base + nr]);
+        pack_b_panel(b, ldb, pc, jc, kc, nc, nr, jp, panel);
+    }
+}
+
+#[inline(always)]
+fn should_parallel_pack_b(kc: usize, nc: usize, nr: usize) -> bool {
+    rayon::current_num_threads() > 1
+        && div_ceil(nc, nr) >= 2
+        && kc.saturating_mul(nc) >= PACK_B_PAR_MIN_WORK
+}
+
+#[inline]
+fn pack_b_panel(
+    b: &[f32],
+    ldb: usize,
+    pc: usize,
+    jc: usize,
+    kc: usize,
+    nc: usize,
+    nr: usize,
+    jp: usize,
+    panel: &mut [f32],
+) {
+    let col_base = jp * nr;
+    let edge_cols = (nc - col_base).min(nr);
+    for kk in 0..kc {
+        let src_row = pc + kk;
+        let dst_base = kk * nr;
+        let src_base = src_row * ldb + jc + col_base;
+        panel[dst_base..dst_base + edge_cols].copy_from_slice(&b[src_base..src_base + edge_cols]);
+        if edge_cols < nr {
+            panel[dst_base + edge_cols..dst_base + nr].fill(0.0);
+        }
+    }
+}
+
+#[inline(always)]
+unsafe fn microkernel_edge_tile_fast(
+    a: *const f32,
+    b: *const f32,
+    c: *mut f32,
+    kc: usize,
+    ldc: usize,
+    tile_m: usize,
+    tile_n: usize,
+    nr_actual: usize,
+    accumulate_c: bool,
+    kernel: KernelKind,
+) {
+    let mut scratch = [0.0f32; MR * NR_AVX512];
+
+    if accumulate_c {
+        for ii in 0..tile_m {
+            let src = c.add(ii * ldc);
+            let dst = scratch.as_mut_ptr().add(ii * nr_actual);
+            std::ptr::copy_nonoverlapping(src, dst, tile_n);
         }
     }
 
-    if full_panels < n_panels {
-        let jp = full_panels;
-        let panel_base = jp * panel_stride;
-        let panel = &mut packed_b[panel_base..panel_base + panel_stride];
-        let col_base = jp * nr;
-        let edge_cols = nc - col_base;
-        for kk in 0..kc {
-            let src_row = pc + kk;
-            let dst_base = kk * nr;
-            let src_base = src_row * ldb + jc + col_base;
-            panel[dst_base..dst_base + edge_cols]
-                .copy_from_slice(&b[src_base..src_base + edge_cols]);
-            panel[dst_base + edge_cols..dst_base + nr].fill(0.0);
+    match kernel {
+        KernelKind::Avx512 => {
+            #[cfg(target_arch = "x86_64")]
+            {
+                microkernel_6x32_avx512(
+                    a,
+                    b,
+                    scratch.as_mut_ptr(),
+                    kc,
+                    nr_actual,
+                    true,
+                );
+            }
+            #[cfg(not(target_arch = "x86_64"))]
+            unreachable!("AVX-512 edge fast path is only selected on x86_64");
         }
+        KernelKind::Avx2 => {
+            #[cfg(target_arch = "x86_64")]
+            {
+                microkernel_6x16_avx2(
+                    a,
+                    b,
+                    scratch.as_mut_ptr(),
+                    kc,
+                    nr_actual,
+                    true,
+                );
+            }
+            #[cfg(not(target_arch = "x86_64"))]
+            unreachable!("AVX2 edge fast path is only selected on x86_64");
+        }
+        KernelKind::Scalar => {
+            microkernel_scalar_edge(
+                a,
+                b,
+                scratch.as_mut_ptr(),
+                kc,
+                nr_actual,
+                tile_m,
+                tile_n,
+                nr_actual,
+                false,
+            );
+        }
+    }
+
+    for ii in 0..tile_m {
+        let src = scratch.as_ptr().add(ii * nr_actual);
+        let dst = c.add(ii * ldc);
+        std::ptr::copy_nonoverlapping(src, dst, tile_n);
+    }
+}
+
+#[inline(always)]
+unsafe fn microkernel_edge_tile_fast_small(
+    a: *const f32,
+    b: *const f32,
+    c: *mut f32,
+    kc: usize,
+    ldc: usize,
+    tile_m: usize,
+    tile_n: usize,
+    nr_actual: usize,
+    accumulate_c: bool,
+    kernel: KernelKind,
+) {
+    let mut scratch = [0.0f32; MR_SMALL * NR_SMALL_AVX512];
+
+    if accumulate_c {
+        for ii in 0..tile_m {
+            let src = c.add(ii * ldc);
+            let dst = scratch.as_mut_ptr().add(ii * nr_actual);
+            std::ptr::copy_nonoverlapping(src, dst, tile_n);
+        }
+    }
+
+    match kernel {
+        KernelKind::Avx512 => {
+            #[cfg(target_arch = "x86_64")]
+            {
+                microkernel_4x16_avx512(
+                    a,
+                    b,
+                    scratch.as_mut_ptr(),
+                    kc,
+                    nr_actual,
+                    true,
+                );
+            }
+            #[cfg(not(target_arch = "x86_64"))]
+            unreachable!("AVX-512 edge fast path is only selected on x86_64");
+        }
+        KernelKind::Avx2 => {
+            #[cfg(target_arch = "x86_64")]
+            {
+                microkernel_4x8_avx2(
+                    a,
+                    b,
+                    scratch.as_mut_ptr(),
+                    kc,
+                    nr_actual,
+                    true,
+                );
+            }
+            #[cfg(not(target_arch = "x86_64"))]
+            unreachable!("AVX2 edge fast path is only selected on x86_64");
+        }
+        KernelKind::Scalar => {
+            microkernel_scalar_edge_small(
+                a,
+                b,
+                scratch.as_mut_ptr(),
+                kc,
+                nr_actual,
+                tile_m,
+                tile_n,
+                nr_actual,
+                false,
+            );
+        }
+    }
+
+    for ii in 0..tile_m {
+        let src = scratch.as_ptr().add(ii * nr_actual);
+        let dst = c.add(ii * ldc);
+        std::ptr::copy_nonoverlapping(src, dst, tile_n);
     }
 }
 
@@ -870,19 +1310,34 @@ fn gebp(
                     }
                 }
             } else {
-                // SAFETY: edge dimensions cap writes/reads to in-bounds regions; packed panels are zero-padded.
-                unsafe {
-                    microkernel_scalar_edge(
-                        a_panel.as_ptr(),
-                        b_panel.as_ptr(),
-                        c_rows.as_mut_ptr().add(c_offset),
-                        kc,
-                        ldc,
-                        tile_m,
-                        tile_n,
-                        nr_actual,
-                        accumulate_c,
-                    );
+                match kernel {
+                    KernelKind::Avx512 | KernelKind::Avx2 => unsafe {
+                        microkernel_edge_tile_fast(
+                            a_panel.as_ptr(),
+                            b_panel.as_ptr(),
+                            c_rows.as_mut_ptr().add(c_offset),
+                            kc,
+                            ldc,
+                            tile_m,
+                            tile_n,
+                            nr_actual,
+                            accumulate_c,
+                            kernel,
+                        );
+                    },
+                    KernelKind::Scalar => unsafe {
+                        microkernel_scalar_edge(
+                            a_panel.as_ptr(),
+                            b_panel.as_ptr(),
+                            c_rows.as_mut_ptr().add(c_offset),
+                            kc,
+                            ldc,
+                            tile_m,
+                            tile_n,
+                            nr_actual,
+                            accumulate_c,
+                        );
+                    },
                 }
             }
         }
@@ -1062,6 +1517,300 @@ unsafe fn microkernel_scalar_edge(
                 *c_ptr = acc;
             }
         }
+    }
+}
+
+#[inline(always)]
+unsafe fn microkernel_scalar_edge_direct(
+    a: *const f32,
+    b: *const f32,
+    c: *mut f32,
+    kc: usize,
+    lda: usize,
+    ldb: usize,
+    ldc: usize,
+    m_tile: usize,
+    n_tile: usize,
+    alpha: f32,
+    accumulate_c: bool,
+) {
+    for ii in 0..m_tile {
+        for jj in 0..n_tile {
+            let mut acc = 0.0f32;
+            for kk in 0..kc {
+                let a_val = *a.add(ii * lda + kk);
+                let b_val = *b.add(kk * ldb + jj);
+                acc += a_val * b_val;
+            }
+            acc *= alpha;
+
+            let c_ptr = c.add(ii * ldc + jj);
+            if accumulate_c {
+                *c_ptr += acc;
+            } else {
+                *c_ptr = acc;
+            }
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+#[inline]
+unsafe fn microkernel_6x16_direct_avx2(
+    a: *const f32,
+    b: *const f32,
+    c: *mut f32,
+    kc: usize,
+    lda: usize,
+    ldb: usize,
+    ldc: usize,
+    alpha: f32,
+    accumulate_c: bool,
+) {
+    use std::arch::x86_64::*;
+
+    let mut c0 = _mm256_setzero_ps();
+    let mut c1 = _mm256_setzero_ps();
+    let mut c2 = _mm256_setzero_ps();
+    let mut c3 = _mm256_setzero_ps();
+    let mut c4 = _mm256_setzero_ps();
+    let mut c5 = _mm256_setzero_ps();
+
+    let mut c6 = _mm256_setzero_ps();
+    let mut c7 = _mm256_setzero_ps();
+    let mut c8 = _mm256_setzero_ps();
+    let mut c9 = _mm256_setzero_ps();
+    let mut c10 = _mm256_setzero_ps();
+    let mut c11 = _mm256_setzero_ps();
+
+    for kk in 0..kc {
+        let b_row = b.add(kk * ldb);
+        let b0 = _mm256_loadu_ps(b_row);
+        let b1 = _mm256_loadu_ps(b_row.add(8));
+        let a_col = a.add(kk);
+
+        let a0 = _mm256_set1_ps(*a_col);
+        c0 = _mm256_fmadd_ps(b0, a0, c0);
+        c6 = _mm256_fmadd_ps(b1, a0, c6);
+
+        let a1 = _mm256_set1_ps(*a_col.add(lda));
+        c1 = _mm256_fmadd_ps(b0, a1, c1);
+        c7 = _mm256_fmadd_ps(b1, a1, c7);
+
+        let a2 = _mm256_set1_ps(*a_col.add(2 * lda));
+        c2 = _mm256_fmadd_ps(b0, a2, c2);
+        c8 = _mm256_fmadd_ps(b1, a2, c8);
+
+        let a3 = _mm256_set1_ps(*a_col.add(3 * lda));
+        c3 = _mm256_fmadd_ps(b0, a3, c3);
+        c9 = _mm256_fmadd_ps(b1, a3, c9);
+
+        let a4 = _mm256_set1_ps(*a_col.add(4 * lda));
+        c4 = _mm256_fmadd_ps(b0, a4, c4);
+        c10 = _mm256_fmadd_ps(b1, a4, c10);
+
+        let a5 = _mm256_set1_ps(*a_col.add(5 * lda));
+        c5 = _mm256_fmadd_ps(b0, a5, c5);
+        c11 = _mm256_fmadd_ps(b1, a5, c11);
+    }
+
+    if alpha.to_bits() != 1.0f32.to_bits() {
+        let alpha_v = _mm256_set1_ps(alpha);
+        c0 = _mm256_mul_ps(c0, alpha_v);
+        c1 = _mm256_mul_ps(c1, alpha_v);
+        c2 = _mm256_mul_ps(c2, alpha_v);
+        c3 = _mm256_mul_ps(c3, alpha_v);
+        c4 = _mm256_mul_ps(c4, alpha_v);
+        c5 = _mm256_mul_ps(c5, alpha_v);
+        c6 = _mm256_mul_ps(c6, alpha_v);
+        c7 = _mm256_mul_ps(c7, alpha_v);
+        c8 = _mm256_mul_ps(c8, alpha_v);
+        c9 = _mm256_mul_ps(c9, alpha_v);
+        c10 = _mm256_mul_ps(c10, alpha_v);
+        c11 = _mm256_mul_ps(c11, alpha_v);
+    }
+
+    let row0 = c;
+    let row1 = c.add(ldc);
+    let row2 = c.add(2 * ldc);
+    let row3 = c.add(3 * ldc);
+    let row4 = c.add(4 * ldc);
+    let row5 = c.add(5 * ldc);
+
+    if accumulate_c {
+        let old0a = _mm256_loadu_ps(row0);
+        let old0b = _mm256_loadu_ps(row0.add(8));
+        _mm256_storeu_ps(row0, _mm256_add_ps(old0a, c0));
+        _mm256_storeu_ps(row0.add(8), _mm256_add_ps(old0b, c6));
+
+        let old1a = _mm256_loadu_ps(row1);
+        let old1b = _mm256_loadu_ps(row1.add(8));
+        _mm256_storeu_ps(row1, _mm256_add_ps(old1a, c1));
+        _mm256_storeu_ps(row1.add(8), _mm256_add_ps(old1b, c7));
+
+        let old2a = _mm256_loadu_ps(row2);
+        let old2b = _mm256_loadu_ps(row2.add(8));
+        _mm256_storeu_ps(row2, _mm256_add_ps(old2a, c2));
+        _mm256_storeu_ps(row2.add(8), _mm256_add_ps(old2b, c8));
+
+        let old3a = _mm256_loadu_ps(row3);
+        let old3b = _mm256_loadu_ps(row3.add(8));
+        _mm256_storeu_ps(row3, _mm256_add_ps(old3a, c3));
+        _mm256_storeu_ps(row3.add(8), _mm256_add_ps(old3b, c9));
+
+        let old4a = _mm256_loadu_ps(row4);
+        let old4b = _mm256_loadu_ps(row4.add(8));
+        _mm256_storeu_ps(row4, _mm256_add_ps(old4a, c4));
+        _mm256_storeu_ps(row4.add(8), _mm256_add_ps(old4b, c10));
+
+        let old5a = _mm256_loadu_ps(row5);
+        let old5b = _mm256_loadu_ps(row5.add(8));
+        _mm256_storeu_ps(row5, _mm256_add_ps(old5a, c5));
+        _mm256_storeu_ps(row5.add(8), _mm256_add_ps(old5b, c11));
+    } else {
+        _mm256_storeu_ps(row0, c0);
+        _mm256_storeu_ps(row0.add(8), c6);
+        _mm256_storeu_ps(row1, c1);
+        _mm256_storeu_ps(row1.add(8), c7);
+        _mm256_storeu_ps(row2, c2);
+        _mm256_storeu_ps(row2.add(8), c8);
+        _mm256_storeu_ps(row3, c3);
+        _mm256_storeu_ps(row3.add(8), c9);
+        _mm256_storeu_ps(row4, c4);
+        _mm256_storeu_ps(row4.add(8), c10);
+        _mm256_storeu_ps(row5, c5);
+        _mm256_storeu_ps(row5.add(8), c11);
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f")]
+#[inline]
+unsafe fn microkernel_6x32_direct_avx512(
+    a: *const f32,
+    b: *const f32,
+    c: *mut f32,
+    kc: usize,
+    lda: usize,
+    ldb: usize,
+    ldc: usize,
+    alpha: f32,
+    accumulate_c: bool,
+) {
+    use std::arch::x86_64::*;
+
+    let mut c0 = _mm512_setzero_ps();
+    let mut c1 = _mm512_setzero_ps();
+    let mut c2 = _mm512_setzero_ps();
+    let mut c3 = _mm512_setzero_ps();
+    let mut c4 = _mm512_setzero_ps();
+    let mut c5 = _mm512_setzero_ps();
+
+    let mut c6 = _mm512_setzero_ps();
+    let mut c7 = _mm512_setzero_ps();
+    let mut c8 = _mm512_setzero_ps();
+    let mut c9 = _mm512_setzero_ps();
+    let mut c10 = _mm512_setzero_ps();
+    let mut c11 = _mm512_setzero_ps();
+
+    for kk in 0..kc {
+        let b_row = b.add(kk * ldb);
+        let b0 = _mm512_loadu_ps(b_row);
+        let b1 = _mm512_loadu_ps(b_row.add(16));
+        let a_col = a.add(kk);
+
+        let a0 = _mm512_set1_ps(*a_col);
+        c0 = _mm512_fmadd_ps(b0, a0, c0);
+        c6 = _mm512_fmadd_ps(b1, a0, c6);
+
+        let a1 = _mm512_set1_ps(*a_col.add(lda));
+        c1 = _mm512_fmadd_ps(b0, a1, c1);
+        c7 = _mm512_fmadd_ps(b1, a1, c7);
+
+        let a2 = _mm512_set1_ps(*a_col.add(2 * lda));
+        c2 = _mm512_fmadd_ps(b0, a2, c2);
+        c8 = _mm512_fmadd_ps(b1, a2, c8);
+
+        let a3 = _mm512_set1_ps(*a_col.add(3 * lda));
+        c3 = _mm512_fmadd_ps(b0, a3, c3);
+        c9 = _mm512_fmadd_ps(b1, a3, c9);
+
+        let a4 = _mm512_set1_ps(*a_col.add(4 * lda));
+        c4 = _mm512_fmadd_ps(b0, a4, c4);
+        c10 = _mm512_fmadd_ps(b1, a4, c10);
+
+        let a5 = _mm512_set1_ps(*a_col.add(5 * lda));
+        c5 = _mm512_fmadd_ps(b0, a5, c5);
+        c11 = _mm512_fmadd_ps(b1, a5, c11);
+    }
+
+    if alpha.to_bits() != 1.0f32.to_bits() {
+        let alpha_v = _mm512_set1_ps(alpha);
+        c0 = _mm512_mul_ps(c0, alpha_v);
+        c1 = _mm512_mul_ps(c1, alpha_v);
+        c2 = _mm512_mul_ps(c2, alpha_v);
+        c3 = _mm512_mul_ps(c3, alpha_v);
+        c4 = _mm512_mul_ps(c4, alpha_v);
+        c5 = _mm512_mul_ps(c5, alpha_v);
+        c6 = _mm512_mul_ps(c6, alpha_v);
+        c7 = _mm512_mul_ps(c7, alpha_v);
+        c8 = _mm512_mul_ps(c8, alpha_v);
+        c9 = _mm512_mul_ps(c9, alpha_v);
+        c10 = _mm512_mul_ps(c10, alpha_v);
+        c11 = _mm512_mul_ps(c11, alpha_v);
+    }
+
+    let row0 = c;
+    let row1 = c.add(ldc);
+    let row2 = c.add(2 * ldc);
+    let row3 = c.add(3 * ldc);
+    let row4 = c.add(4 * ldc);
+    let row5 = c.add(5 * ldc);
+
+    if accumulate_c {
+        let old0a = _mm512_loadu_ps(row0);
+        let old0b = _mm512_loadu_ps(row0.add(16));
+        _mm512_storeu_ps(row0, _mm512_add_ps(old0a, c0));
+        _mm512_storeu_ps(row0.add(16), _mm512_add_ps(old0b, c6));
+
+        let old1a = _mm512_loadu_ps(row1);
+        let old1b = _mm512_loadu_ps(row1.add(16));
+        _mm512_storeu_ps(row1, _mm512_add_ps(old1a, c1));
+        _mm512_storeu_ps(row1.add(16), _mm512_add_ps(old1b, c7));
+
+        let old2a = _mm512_loadu_ps(row2);
+        let old2b = _mm512_loadu_ps(row2.add(16));
+        _mm512_storeu_ps(row2, _mm512_add_ps(old2a, c2));
+        _mm512_storeu_ps(row2.add(16), _mm512_add_ps(old2b, c8));
+
+        let old3a = _mm512_loadu_ps(row3);
+        let old3b = _mm512_loadu_ps(row3.add(16));
+        _mm512_storeu_ps(row3, _mm512_add_ps(old3a, c3));
+        _mm512_storeu_ps(row3.add(16), _mm512_add_ps(old3b, c9));
+
+        let old4a = _mm512_loadu_ps(row4);
+        let old4b = _mm512_loadu_ps(row4.add(16));
+        _mm512_storeu_ps(row4, _mm512_add_ps(old4a, c4));
+        _mm512_storeu_ps(row4.add(16), _mm512_add_ps(old4b, c10));
+
+        let old5a = _mm512_loadu_ps(row5);
+        let old5b = _mm512_loadu_ps(row5.add(16));
+        _mm512_storeu_ps(row5, _mm512_add_ps(old5a, c5));
+        _mm512_storeu_ps(row5.add(16), _mm512_add_ps(old5b, c11));
+    } else {
+        _mm512_storeu_ps(row0, c0);
+        _mm512_storeu_ps(row0.add(16), c6);
+        _mm512_storeu_ps(row1, c1);
+        _mm512_storeu_ps(row1.add(16), c7);
+        _mm512_storeu_ps(row2, c2);
+        _mm512_storeu_ps(row2.add(16), c8);
+        _mm512_storeu_ps(row3, c3);
+        _mm512_storeu_ps(row3.add(16), c9);
+        _mm512_storeu_ps(row4, c4);
+        _mm512_storeu_ps(row4.add(16), c10);
+        _mm512_storeu_ps(row5, c5);
+        _mm512_storeu_ps(row5.add(16), c11);
     }
 }
 
@@ -1386,7 +2135,7 @@ unsafe fn microkernel_6x32_avx512(
 }
 
 fn maybe_log_tiling(kernel: KernelKind) {
-    if std::env::var_os("FORGE_LOG_TILING").is_none() {
+    if !cached_env_flag(&LOG_TILING, "FORGE_LOG_TILING") {
         return;
     }
     let tiles = tile_blocks();
@@ -1441,8 +2190,10 @@ fn autotune_tiles() -> TileConfig {
 
     let kc = if l2_bytes >= 2 * 1024 * 1024 {
         384
+    } else if l2_bytes >= 1024 * 1024 {
+        192
     } else if l2_bytes >= 512 * 1024 {
-        KC_DEFAULT
+        160
     } else {
         128
     };

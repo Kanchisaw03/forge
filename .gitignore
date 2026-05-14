@@ -1,6 +1,15 @@
 # Design docs
 forge_system_design_part*.md.resolved
+forge_optimization_plan.md.resolved
 FORGE_SESSION_CONTEXT.md
+
+# Benchmark & utility scripts
+forge_benchmark_display.py
+scripts/simple_median3.py
+scripts/social_bench.py
+scripts/run_simple_median3.ps1
+scripts/run_social_bench.ps1
+scripts/__pycache__/
 
 # Build artifacts
 /target/
@@ -11,6 +20,7 @@ FORGE_SESSION_CONTEXT.md
 /.cargo/*
 !/.cargo/config.toml
 /.venv/
+/.venv-wsl/
 
 # Rust backups
 **/*.rs.bk

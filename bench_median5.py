@@ -24,7 +24,7 @@ ROOT_DIR = Path(__file__).resolve().parent
 SIZES = (256, 512, 1024)
 WARMUP = 5
 ITERS = 20
-RUNS = 5  # number of full benchmark passes for the median
+RUNS = 10  # number of full benchmark passes for the median
 
 FORGE_RESULT_RE = re.compile(
     r"FORGE_RESULT:\s+size=(\d+)x\1\s+latency_ms=([0-9.]+)\s+gflops=([0-9.]+)"
